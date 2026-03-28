@@ -38,7 +38,7 @@ data:
   dataset: imagenet100
   train_path: "./datasets/imagenet100/train"
   val_path: "./datasets/imagenet100/val"
-  preload: False
+  preload: True
   format: "image_folder"
   num_workers: 6
 
