@@ -31,7 +31,7 @@ Keep the released ImageNet-100 setup:
 - grayscale `0.2`
 - Gaussian blur `0.5`
 - solarization `0.1`
-- optimizer: `AdamW`
+- optimizer: `LARS`
 - batch size `128`
 - learning rate `0.0825`
 - classifier learning rate `0.0275`
@@ -157,10 +157,36 @@ This keeps the implementation close to the current repo and reduces code changes
 
 ## 4.4 Teacher branch
 
+### Default JEPA teacher for ImageNet-100 v0
+
+Use a frozen **I-JEPA ViT-H/14 ImageNet-1K checkpoint** as the default teacher:
+
+- Hugging Face model id: `facebook/ijepa_vith14_1k`
+- family: `I-JEPA`
+- architecture: `ViT-H/14`
+- pretraining data: `ImageNet-1K`
+- intended use: **feature extraction**
+- teacher output dim: `1280`
+- default pooling: mean over `last_hidden_state`
+
+This should be the default teacher for all teacher-based baselines in v0.
+
+Why this teacher:
+
+- it is a real JEPA teacher,
+- it has a public, easy-to-load checkpoint,
+- it is already trained on the same broad natural-image domain,
+- it gives a single strong semantic feature vector per image with minimal extra code,
+- it avoids training a separate teacher from scratch on ImageNet-100.
+
+Do **not** start with a custom teacher trained inside this repo. Use the off-the-shelf ImageNet-1K I-JEPA teacher first.
+
+### Teacher forward contract
+
 Use a frozen teacher wrapper that returns one vector per image:
 
 ```python
-t = teacher(x)  # shape [B, teacher_dim]
+t = teacher(x)  # shape [B, 1280]
 ```
 
 Requirements:
@@ -168,9 +194,130 @@ Requirements:
 - `teacher.eval()` always,
 - `torch.no_grad()` always,
 - teacher parameters excluded from optimizer,
-- output dim `teacher_dim` inferred at runtime if possible.
+- default `teacher_dim = 1280`,
+- output dim can still be inferred at runtime from the teacher config,
+- do not create a separate teacher projector in v0.
 
-## 4.5 Alignment head
+### Important normalization rule
+
+Do **not** call `AutoProcessor` inside the training loop.
+
+The current ImageNet-100 repo pipeline already produces `224x224` tensors normalized with standard ImageNet mean/std. The I-JEPA teacher uses the same ImageNet normalization convention, so the same augmented crop tensor should be sent directly to the teacher.
+
+That means:
+
+- student and teacher receive the exact same crop tensor,
+- crop correspondence is preserved,
+- no extra PIL/CPU preprocessing is introduced,
+- no second augmentation pipeline is needed.
+
+If you ever want to use `AutoProcessor`, only use it for one-off offline debugging, not for online training.
+
+## 4.5 Teacher implementation details
+
+Implement the teacher as a dedicated wrapper around `transformers.AutoModel`.
+
+Suggested class name:
+
+```python
+FrozenIJepaTeacher
+```
+
+Suggested behavior:
+
+- load `AutoModel.from_pretrained("facebook/ijepa_vith14_1k")`,
+- freeze all parameters,
+- keep the model in eval mode forever,
+- infer `output_dim = model.config.hidden_size`,
+- pool the teacher sequence output to one vector,
+- support chunked forward to avoid OOM,
+- return `float32` features to the loss even if the teacher internally runs in mixed precision.
+
+### Teacher wrapper pseudocode
+
+```python
+import torch
+import torch.nn as nn
+from transformers import AutoModel
+
+
+class FrozenIJepaTeacher(nn.Module):
+    def __init__(
+        self,
+        model_id: str = "facebook/ijepa_vith14_1k",
+        pooling: str = "mean",
+        chunk_size: int = 16,
+        cast_output_to_float32: bool = True,
+    ):
+        super().__init__()
+        self.model = AutoModel.from_pretrained(model_id)
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+        self.pooling = pooling
+        self.chunk_size = chunk_size
+        self.cast_output_to_float32 = cast_output_to_float32
+        self.output_dim = int(self.model.config.hidden_size)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feats = []
+        for x_chunk in x.split(self.chunk_size, dim=0):
+            outputs = self.model(pixel_values=x_chunk, return_dict=True)
+            h = outputs.last_hidden_state
+
+            if self.pooling == "mean":
+                f = h.mean(dim=1)
+            elif self.pooling == "cls":
+                f = h[:, 0]
+            elif self.pooling == "patch_mean":
+                f = h[:, 1:].mean(dim=1)
+            else:
+                raise ValueError(f"Unknown pooling: {self.pooling}")
+
+            if self.cast_output_to_float32:
+                f = f.float()
+            feats.append(f)
+
+        return torch.cat(feats, dim=0)
+```
+
+### Pooling choice
+
+Default to:
+
+```python
+teacher_feature = outputs.last_hidden_state.mean(dim=1)
+```
+
+This is the simplest choice and matches the public I-JEPA Hugging Face feature-extraction example.
+
+Do **not** start with:
+
+- last-4-layer averaging,
+- token-level teacher supervision,
+- separate teacher projector heads,
+- CLS/patch fusion.
+
+Those are later ablations, not part of v0.
+
+### Memory / speed rule
+
+Because `facebook/ijepa_vith14_1k` is large, teacher forward should support chunking.
+
+Default:
+
+```python
+teacher_chunk_size = 16
+```
+
+If there is OOM:
+
+1. lower `teacher_chunk_size` first,
+2. only lower the main batch size if chunking is still insufficient.
+
+## 4.6 Alignment head
 
 Map `z_c` to teacher space with a single linear layer:
 
@@ -471,6 +618,8 @@ solo/methods/split_teacher_sigjepa.py
 scripts/pretrain/imagenet-100/split_teacher_sigjepa_imagenet100.yaml
 ```
 
+Add a recent `transformers` dependency with I-JEPA support.
+
 ## 9.2 File responsibilities
 
 ### `solo/losses/sigreg.py`
@@ -496,11 +645,16 @@ Make sure these are plain functions, not methods.
 
 ### `solo/utils/teacher.py`
 
-Contains a tiny frozen teacher wrapper:
+Contains the concrete I-JEPA teacher implementation for v0:
 
-- load teacher from checkpoint or timm,
+- `FrozenIJepaTeacher`,
+- `build_teacher(cfg)` factory,
+- one code path only: Hugging Face I-JEPA first,
 - expose `forward(x) -> [B, teacher_dim]`,
-- stay in `eval()` and `no_grad()`.
+- stay in `eval()` and `no_grad()`,
+- support chunked forward with `teacher_chunk_size`.
+
+Do **not** build a generic teacher zoo in the first pass. Keep the code path focused on `facebook/ijepa_vith14_1k`.
 
 ### `solo/methods/split_teacher_sigjepa.py`
 
@@ -513,6 +667,31 @@ Contains the v0 training config.
 ---
 
 ## 10. Method implementation details
+
+## 10.0 Teacher loader contract
+
+The method should build the teacher once in `__init__`:
+
+```python
+self.teacher = build_teacher(cfg)
+self.teacher_dim = self.teacher.output_dim
+```
+
+Recommended config contract:
+
+```python
+teacher_backend == "hf_ijepa"
+teacher_model_id == "facebook/ijepa_vith14_1k"
+teacher_pooling == "mean"
+teacher_chunk_size == 16
+```
+
+Additional rules:
+
+- call `self.teacher.requires_grad_(False)` after construction,
+- do not register teacher params in `learnable_params`,
+- do not wrap the teacher in DDP-specific logic manually,
+- teacher outputs must already be pooled to shape `[B, teacher_dim]` before the alignment loss.
 
 ## 10.1 Method class skeleton
 
@@ -668,11 +847,13 @@ method_kwargs:
   sigreg_t_max: 5.0
   sigreg_use_real: false
 
-  teacher_source: "checkpoint"
-  teacher_ckpt_path: "/path/to/teacher.ckpt"
-  teacher_name: null
-  teacher_feature_key: null
-  teacher_output_dim: null
+  teacher_backend: "hf_ijepa"
+  teacher_model_id: "facebook/ijepa_vith14_1k"
+  teacher_local_dir: null
+  teacher_pooling: "mean"
+  teacher_output_dim: 1280
+  teacher_chunk_size: 16
+  teacher_use_same_views: true
 
   projector_type: "mlp"
   add_projector_classifier: true
@@ -717,7 +898,7 @@ augmentations:
     num_crops: 2
 
 optimizer:
-  name: "adamw"
+  name: "lars"
   batch_size: 128
   lr: 0.0825
   classifier_lr: 0.0275
@@ -738,6 +919,13 @@ strategy: "ddp"
 precision: 16-mixed
 ```
 
+Teacher-specific config notes:
+
+- keep `teacher_model_id = "facebook/ijepa_vith14_1k"` fixed for all teacher-based baselines,
+- keep `teacher_pooling = "mean"` fixed in v0,
+- pass the same normalized crops used by the student directly to the teacher,
+- do not add a second teacher transform pipeline.
+
 ---
 
 ## 14. Benchmarks and baselines
@@ -757,7 +945,8 @@ For every run, report:
 - average `SIGReg(z_f)`,
 - train wall-clock time,
 - peak GPU memory,
-- optional kNN accuracy if already wired in the repo.
+- optional kNN accuracy if already wired in the repo,
+- teacher forward time per step if easy to log.
 
 ## 14.2 Secondary transfer metrics
 
@@ -851,13 +1040,15 @@ This is the main method.
 
 ## 14.4 Optional teacher-source comparison
 
-If multiple teacher checkpoints are available, rerun B2/B3/B6 with:
+Only after the default I-JEPA teacher works, rerun B2/B3/B6 with:
 
-- large JEPA teacher,
-- DINO-style teacher,
-- other frozen foundation model teacher.
+- default JEPA teacher: `facebook/ijepa_vith14_1k`,
+- alternative JEPA teacher if one is available locally,
+- non-JEPA teacher only as an optional out-of-family comparison.
 
 Keep the student, budget, and hyperparameters unchanged.
+
+For v0, all main comparisons should use the same default I-JEPA teacher.
 
 ---
 
@@ -1001,7 +1192,13 @@ Run for `10` to `20` epochs on ImageNet-100 with:
 - `lambda_sigreg = 0.05`
 - `num_slices = 64`
 
-Goal: verify shapes, DDP, AMP, teacher loading, and logs.
+Goal: verify shapes, DDP, AMP, teacher loading, teacher normalization adaptation, and logs.
+
+Extra smoke-test requirement:
+
+- print and verify `teacher_dim == 1280` for `facebook/ijepa_vith14_1k`,
+- verify teacher forward works on the already-normalized student crops,
+- verify chunked teacher forward returns the same shape as non-chunked forward.
 
 ### Phase 2: short benchmark
 
@@ -1028,7 +1225,7 @@ Run `1000` epochs for:
 
 The **only** thing v0 should test is:
 
-> Can a student latent be split into a teacher-compatible subspace `z_c` and a free subspace `z_f`, with teacher loss on `z_c`, SIGReg on `z_f`, and JEPA predictive loss on the full concatenated latent?
+> Can a student latent be split into a teacher-compatible subspace `z_c` and a free subspace `z_f`, with a frozen official I-JEPA teacher on `z_c`, SIGReg on `z_f`, and JEPA predictive loss on the full concatenated latent?
 
 If this minimal version works, then later versions can add:
 
