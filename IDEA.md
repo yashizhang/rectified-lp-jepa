@@ -1,558 +1,654 @@
-# Split-Align Rectified LpJEPA for ImageNet-1K
+# Barebones Split-Teacher SIGReg JEPA for ImageNet-100
 
-## Assumption and scope
+## 0. Purpose
 
-The attached Rectified LpJEPA paper and the public repo are centered on the ImageNet-100 recipe, not a released ImageNet-1K config. This document therefore defines an **ImageNet-1K adaptation** that keeps the repo's overall training style the same—ResNet-50 student, 3-layer MLP-style projector, two augmented views, RDMReg, LARS, warmup+cosine, mixed precision—and adds a **teacher-aligned split latent** on top.
+This document is a **coding spec** for a minimal first implementation on top of the `rectified-lp-jepa` repo.
 
-The core idea is:
+The goal is to keep the method as simple as possible:
 
-- split the student projector latent into a **compatible branch** `z_c` and a **free branch** `z_f`;
-- align only `z_c` to a frozen large pretrained teacher;
-- regularize only `z_f` with the existing Rectified LpJEPA machinery;
-- explicitly decorrelate `z_c` and `z_f` so the free branch does not just copy the teacher-aligned branch.
+1. **teacher loss on `z_c` only**,
+2. **regularization loss on `z_f` only**,
+3. **predictive loss on `torch.cat([z_c, z_f], dim=1)`**.
 
-This is meant to be implemented directly on top of the current repo structure:
-
-- `solo/methods/rectified_lpjepa.py`
-- `solo/losses/rectified_lpjepa.py`
-- `scripts/pretrain/imagenet-100/rectified_lpjepa_imagenet.yaml`
-
-The new method name should be:
-
-`split_align_rectified_lpjepa`
+This version is intentionally minimal and should be preferred over more ambitious variants for the first pass.
 
 ---
 
-## 1. Method summary
+## 1. Hard constraints for v0
 
-### Name
+### Use the same ImageNet-100 training setting as the repo/paper
 
-**Split-Align Rectified LpJEPA (SA-RLpJEPA)**
+Keep the released ImageNet-100 setup:
 
-### Goal
-
-Learn a student latent
-
-$$
-z_s = [z_c, z_f]
-$$
-
-where:
-
-- `z_c` is a **small compatibility subspace** trained to match a frozen large teacher;
-- `z_f` is a **free sparse subspace** trained with Rectified Distribution Matching Regularization (RDMReg).
-
-The method should preserve the repo's good sparsity behavior while injecting teacher semantics into only a controlled subset of the student representation.
-
-### Why this is a good fit for this repo
-
-The repo already has:
-
-- a two-view JEPA-style invariance loss,
-- RDMReg / sliced Wasserstein distribution matching,
-- projection utilities,
-- sparsity logging,
-- optional projector classifier.
-
-So the minimal conceptual extension is **not** to replace Rectified LpJEPA, but to **factor its projector output into two branches** and add a frozen teacher path.
-
----
-
-## 2. Concrete student and teacher architecture
-
-## 2.1 Student
-
-Keep the current student backbone unchanged for the first paper run:
-
-- `backbone = resnet50`
-- same two-view augmentation pipeline as the current repo / paper
-- same encoder forward path from `BaseMethod`
-
-Replace the current single projector with a **shared trunk + two heads**:
-
-### Shared projector trunk
-
-```text
-feats -> Linear(features_dim, 2048)
-      -> BatchNorm1d(2048)
-      -> ReLU
-      -> Linear(2048, 2048)
-      -> BatchNorm1d(2048)
-      -> ReLU
-      -> h
-```
-
-### Compatible head
-
-```text
-h -> Linear(2048, D_c) -> z_c
-```
-
-- no final ReLU
-- signed output is allowed
-- default `D_c = 512`
-
-### Free head
-
-```text
-h -> Linear(2048, D_f) -> ReLU -> z_f
-```
-
-- explicit non-negativity preserved here
-- default `D_f = 1536`
-- require `D_c + D_f = 2048`
-
-### Final student latent used for probing / online classifier
-
-```python
-z = torch.cat([z_c, z_f], dim=1)
-```
-
-Use the concatenated `z` for the optional online projector classifier so that the reported projector probe measures the full student representation.
-
-## 2.2 Teacher
-
-Add a frozen teacher wrapper. Do **not** hard-code a single teacher family into the method. Support:
-
-1. a checkpointed large JEPA / SSL model,
-2. a `timm` feature extractor,
-3. a plain custom PyTorch module loaded from path.
-
-For the first implementation, the teacher interface only needs to return **one global feature vector per image**:
-
-```python
-t = teacher(images)  # shape [B, D_t]
-```
-
-Recommended default experimental setup:
-
-- frozen large teacher,
-- global pooled feature,
-- L2 normalization before alignment,
-- no teacher gradients,
-- `eval()` mode always.
-
-## 2.3 Alignment head
-
-Map the small compatible branch into teacher feature space:
-
-```text
-z_c -> LayerNorm(D_c) -> Linear(D_c, D_t, bias=False) -> a
-```
-
-where:
-
-- `a` is the teacher-aligned student vector,
-- `D_t` is auto-detected from the teacher,
-- the linear layer weight is named `align_head.weight`.
-
-Default:
-
-- `D_c = 512`
-- `D_t = teacher output dim`
-
----
-
-## 3. Forward pass
-
-For two student views `x1, x2`:
-
-```python
-f1 = backbone(x1)
-f2 = backbone(x2)
-
-h1 = shared_projector(f1)
-h2 = shared_projector(f2)
-
-z_c1 = compatible_head(h1)
-z_c2 = compatible_head(h2)
-
-z_f1 = free_head(h1)   # includes final ReLU
-z_f2 = free_head(h2)
-
-z1 = cat([z_c1, z_f1], dim=1)
-z2 = cat([z_c2, z_f2], dim=1)
-
-a1 = normalize(align_head(layernorm(z_c1)), dim=1)
-a2 = normalize(align_head(layernorm(z_c2)), dim=1)
-
-with torch.no_grad():
-    t1 = normalize(teacher(x1), dim=1)
-    t2 = normalize(teacher(x2), dim=1)
-    t_bar = normalize((t1 + t2) / 2, dim=1)
-```
-
-Important detail: use the **view-averaged teacher target** `t_bar` by default. That makes the teacher anchor less crop-specific than using `t1` and `t2` independently.
-
----
-
-## 4. Concrete loss function
-
-Let the batch size be `B`.
-
-## 4.1 Invariance loss
-
-Use the same JEPA-style view consistency, but apply it separately to the two branches:
-
-$$
-L_{\text{inv}} = \frac{1}{2}\left[\operatorname{MSE}(z_c^1, z_c^2) + \operatorname{MSE}(z_f^1, z_f^2)\right].
-$$
-
-This keeps the factorization explicit and prevents one branch from dominating the other numerically.
-
-## 4.2 Free-branch RDMReg loss
-
-Apply existing Rectified LpJEPA regularization **only** to `z_f`:
-
-$$
-L_{\text{free-rdm}} = \operatorname{RDMReg}(z_f^1, z_f^2; \mu, p, \sigma).
-$$
-
-Implementation note:
-
-- directly reuse `rdmreg_loss(...)` from `solo/losses/rectified_lpjepa.py`
-- target distribution must stay `rectified_lp_distribution`
-- default: `p = 1.0`, `mu = -1.0`, `mode_of_sigma = sigma_GN`
-
-Rationale for the default:
-
-- `p = 1.0` keeps the strong Rectified Laplace prior that worked well in the paper,
-- `mu = -1.0` gives meaningful sparsity without jumping immediately into the extreme `mu = -3` regime.
-
-## 4.3 Instance alignment loss
-
-Align each compatible student view to the same view-averaged teacher target:
-
-$$
-L_{\text{align-inst}} = \frac{1}{2}\left[
-\big(1 - \cos(a_1, t_{\text{bar}})\big) +
-\big(1 - \cos(a_2, t_{\text{bar}})\big)
-\right].
-$$
-
-Use batch mean over samples.
-
-## 4.4 Relation alignment loss
-
-Match the within-batch geometry of the compatible branch to the teacher.
-
-Define:
-
-$$
-\bar a = \operatorname{normalize}\left(\frac{a_1 + a_2}{2}, \text{dim}=1\right),
-\qquad
-G_s = \bar a\bar a^\top - I,
-$$
-
-$$
-G_t = t_{\text{bar}} t_{\text{bar}}^\top - I.
-$$
-
-Then:
-
-$$
-L_{\text{align-rel}} = \frac{1}{B(B-1)} \lVert G_s - G_t \rVert_F^2.
-$$
-
-Use `diag = 0` by subtracting the identity.
-
-Why keep this term:
-
-- direct cosine alignment makes `z_c` match teacher instances,
-- relation loss makes `z_c` match teacher **geometry** and is less brittle when `D_c << D_t`.
-
-## 4.5 Branch decorrelation loss
-
-Prevent `z_f` from degenerating into a copy of `z_c`.
-
-For each view, center and standardize features over the batch:
-
-$$
-\tilde Z_c = \frac{Z_c - \mu(Z_c)}{\sigma(Z_c) + \epsilon},
-\qquad
-\tilde Z_f = \frac{Z_f - \mu(Z_f)}{\sigma(Z_f) + \epsilon}.
-$$
-
-Then compute cross-covariance:
-
-$$
-C_{cf} = \frac{1}{B-1} \tilde Z_c^\top \tilde Z_f.
-$$
-
-Loss:
-
-$$
-L_{\text{decouple}} = \frac{1}{2}
-\left[
-\frac{\lVert C_{cf}^{(1)} \rVert_F^2}{D_c D_f}
-+
-\frac{\lVert C_{cf}^{(2)} \rVert_F^2}{D_c D_f}
-\right].
-$$
-
-This is the key term that makes the split meaningful.
-
-## 4.6 Compatible-branch variance floor
-
-Teacher alignment alone can still collapse `z_c` onto too few student directions. Add a VICReg-style std floor only on the compatible branch:
-
-$$
-L_{\text{c-var}} = \frac{1}{2}
-\sum_{v \in \{1,2\}}
-\frac{1}{D_c}
-\sum_{j=1}^{D_c}
-\max\big(0, \gamma - \operatorname{Std}(Z_{c,j}^{(v)})\big).
-$$
-
-Default:
-
-- `gamma = 1.0`
-
-## 4.7 Alignment-head orthogonality penalty
-
-Since `D_c < D_t`, encourage the alignment head to behave like a near-isometric embedding of the small compatible space into teacher space.
-
-If `W = align_head.weight` with shape `[D_t, D_c]`, add:
-
-$$
-L_{\text{orth}} = \frac{\lVert W^\top W - I_{D_c} \rVert_F^2}{D_c^2}.
-$$
-
-This makes `z_c` preserve geometry better before entering teacher space.
-
-## 4.8 Total loss
-
-Use:
-
-$$
-L =
-\lambda_{\text{inv}} L_{\text{inv}}
-+
-\lambda_{\text{rdm}} L_{\text{free-rdm}}
-+
-\omega(e)\Big[
-\lambda_{\text{inst}} L_{\text{align-inst}}
-+
-\lambda_{\text{rel}} L_{\text{align-rel}}
-\Big]
-+
-\lambda_{\text{dec}} L_{\text{decouple}}
-+
-\lambda_{\text{var}} L_{\text{c-var}}
-+
-\lambda_{\text{orth}} L_{\text{orth}}.
-$$
-
-### Default weights
-
-```text
-lambda_inv   = 25.0
-lambda_rdm   = 125.0
-lambda_inst  = 10.0
-lambda_rel   = 1.0
-lambda_dec   = 0.05
-lambda_var   = 5.0
-lambda_orth  = 1e-3
-```
-
-These are the starting values, not sacred constants.
-
----
-
-## 5. Alignment schedule
-
-Use strong teacher alignment early, then decay it late so the student can use `z_f` more freely.
-
-Let `E` be total epochs and `e` the current epoch.
-
-$$
-\omega(e) =
-\begin{cases}
-1, & e < 0.6E \\
-\omega_{\min} + (1-\omega_{\min})\cdot \frac{1}{2}\left(1 + \cos\left(\pi\frac{e-0.6E}{0.4E}\right)\right), & e \ge 0.6E
-\end{cases}
-$$
-
-Default:
-
-- `omega_min = 0.2`
-
-So alignment stays on for the whole run, but becomes weaker in the final 40%.
-
----
-
-## 6. Default ImageNet-1K training recipe
-
-Keep the paper / repo recipe as intact as possible.
-
-## 6.1 Data
-
-Use:
-
-```yaml
-data:
-  dataset: imagenet
-  train_path: /path/to/imagenet/train
-  val_path: /path/to/imagenet/val
-  format: image_folder
-  preload: false
-  num_workers: 16
-```
-
-Important: set `preload: false` for ImageNet-1K.
-
-## 6.2 Augmentations
-
-Keep the current repo / paper augmentation stack:
-
-- random resized crop, scale `[0.2, 1.0]`, size `224`
+- dataset: `imagenet100`
+- backbone: `resnet50`
+- projector: 3-layer MLP, hidden dim `2048`, output dim `2048`
+- two augmented crops
+- crop size `224`
+- random resized crop scale `[0.2, 1.0]`
 - horizontal flip `0.5`
-- color jitter `0.8`, brightness `0.4`, contrast `0.4`, saturation `0.2`, hue `0.1`
+- color jitter `0.8` with brightness `0.4`, contrast `0.4`, saturation `0.2`, hue `0.1`
 - grayscale `0.2`
 - Gaussian blur `0.5`
 - solarization `0.1`
-- `num_crops: 2`
+- optimizer: `AdamW`
+- batch size `128`
+- learning rate `0.0825`
+- classifier learning rate `0.0275`
+- weight decay `1e-4`
+- scheduler: warmup + cosine
+- `max_epochs = 1000`
+- `precision = 16-mixed`
 
-Do **not** change augmentations in the first version.
+### Do not use Rectified LpJEPA ideas in the proposed method
 
-## 6.3 Optimizer / scheduler
+For the proposed method, **do not** use:
 
-Keep the same style as the repo:
+- RDMReg,
+- rectified target distributions,
+- final ReLU on the projector output,
+- sparsity-specific rectified losses.
 
-- optimizer: `LARS`
-- scheduler: `warmup_cosine`
-- weight decay: `1e-4`
-- mixed precision: `16-mixed`
-- sync batch norm if using DDP
+The repo is only the **codebase to build on**, not the source of the new method design.
 
-Recommended first-pass policy:
+### Do not add extra losses in v0
 
-- keep the repo's per-process batch-size convention,
-- scale LR linearly with effective global batch only after the method is stable.
+Do **not** add these in the first implementation:
 
-Safer first pass:
+- relation distillation,
+- branch decorrelation,
+- orthogonality penalties,
+- predictor heads,
+- EMA teacher,
+- late-stage schedules,
+- extra branch-specific MLPs beyond what is explicitly listed below.
 
-```yaml
-optimizer:
-  name: lars
-  batch_size: 128
-  lr: 0.165
-  classifier_lr: 0.055
-  weight_decay: 1e-4
-```
+If the minimal version works, these can be added later.
 
-If you run multi-GPU with a larger effective batch, scale carefully after a pilot run.
+---
 
-## 6.4 Epochs
+## 2. Proposed method name
 
 Use:
 
-- `max_epochs: 1000`
+`split_teacher_sigjepa`
 
-for the main paper-quality run.
+This name reflects exactly what v0 is:
 
-For debugging:
-
-- `100 epochs` smoke test,
-- `300 epochs` intermediate ablation sweep,
-- `1000 epochs` final runs.
+- split latent,
+- frozen teacher supervision,
+- SIGReg on the free branch,
+- JEPA-style predictive loss.
 
 ---
 
-## 7. Files to add or modify
+## 3. High-level idea
 
-## 7.1 New loss file
-
-Add:
-
-```text
-solo/losses/split_align_rectified_lpjepa.py
-```
-
-It should contain:
-
-- `instance_alignment_loss(...)`
-- `relation_alignment_loss(...)`
-- `branch_decorrelation_loss(...)`
-- `compatible_variance_loss(...)`
-- `orthogonality_loss(...)`
-- `split_align_rectified_lp_jepa_loss(...)`
-
-Implementation note:
-
-- import and reuse `rdmreg_loss`, `determine_sigma_for_lp_dist`, `choose_sigma_for_unit_var` from `solo/losses/rectified_lpjepa.py`
-
-## 7.2 New method file
-
-Add:
-
-```text
-solo/methods/split_align_rectified_lpjepa.py
-```
-
-This class should either:
-
-- subclass `RectifiedLpJEPA`, or
-- subclass `BaseMethod` and reuse `Projections` from `solo/methods/rectified_lpjepa.py`.
-
-Recommended path: **subclass `RectifiedLpJEPA`** and override only what changes.
-
-The class should:
-
-- build shared projector trunk,
-- build `compatible_head`, `free_head`, `align_head`,
-- load and freeze the teacher,
-- expose `z_c`, `z_f`, and concatenated `z`,
-- compute the new total loss in `training_step`,
-- keep the online projector classifier path unchanged.
-
-## 7.3 Teacher utility
-
-Add:
-
-```text
-solo/utils/teacher_wrapper.py
-```
-
-This wrapper should:
-
-- load teacher from config,
-- normalize inputs if teacher needs a different normalization,
-- return a single `[B, D_t]` tensor,
-- stay in `eval()` and `no_grad()` mode,
-- optionally autocast to fp16/bf16 for cheaper inference.
-
-## 7.4 Method registry
-
-Modify:
-
-```text
-solo/methods/__init__.py
-```
-
-Register:
+Let the student projector output be
 
 ```python
-"split_align_rectified_lpjepa": SplitAlignRectifiedLpJEPA
+z = projector(feats)   # shape [B, 2048]
 ```
 
-## 7.5 Config
+Split it into two contiguous chunks:
+
+```python
+z_c = z[:, :compatible_dim]
+z_f = z[:, compatible_dim:]
+```
+
+where:
+
+- `z_c` = **compatible** subspace, aligned to a frozen teacher,
+- `z_f` = **free** subspace, regularized only by `SIGReg`.
+
+Then train with:
+
+- predictive loss on the **full latent** `z = cat([z_c, z_f])`,
+- teacher loss only on `z_c`,
+- SIGReg only on `z_f`.
+
+This is the minimal implementation the user asked for.
+
+---
+
+## 4. Architecture
+
+## 4.1 Student backbone
+
+Keep the current repo choice for the main run:
+
+- `backbone = resnet50`
+
+No change to the encoder path.
+
+## 4.2 Student projector
+
+Use a standard 3-layer MLP, matching the repo dimensions, but **without** a final ReLU:
+
+```python
+projector = nn.Sequential(
+    nn.Linear(features_dim, 2048),
+    nn.BatchNorm1d(2048),
+    nn.ReLU(),
+    nn.Linear(2048, 2048),
+    nn.BatchNorm1d(2048),
+    nn.ReLU(),
+    nn.Linear(2048, 2048),
+)
+```
+
+Important:
+
+- output dimension stays `2048`,
+- output is **signed**, not rectified.
+
+## 4.3 Latent split
+
+Default split:
+
+- `compatible_dim = 512`
+- `free_dim = 1536`
+- require `compatible_dim + free_dim == proj_output_dim`
+
+Split by slicing only. Do **not** make two separate projector heads in v0.
+
+This keeps the implementation close to the current repo and reduces code changes.
+
+## 4.4 Teacher branch
+
+Use a frozen teacher wrapper that returns one vector per image:
+
+```python
+t = teacher(x)  # shape [B, teacher_dim]
+```
+
+Requirements:
+
+- `teacher.eval()` always,
+- `torch.no_grad()` always,
+- teacher parameters excluded from optimizer,
+- output dim `teacher_dim` inferred at runtime if possible.
+
+## 4.5 Alignment head
+
+Map `z_c` to teacher space with a single linear layer:
+
+```python
+align_head = nn.Linear(compatible_dim, teacher_dim, bias=False)
+```
+
+If `compatible_dim == teacher_dim`, allow an optional identity mapping later, but use the linear layer by default in v0.
+
+---
+
+## 5. Exact forward pass
+
+For two views `x1, x2`:
+
+```python
+out1 = super().forward(x1)
+out2 = super().forward(x2)
+
+f1 = out1["feats"]
+f2 = out2["feats"]
+
+z1 = projector(f1)
+z2 = projector(f2)
+
+z_c1 = z1[:, :compatible_dim]
+z_c2 = z2[:, :compatible_dim]
+
+z_f1 = z1[:, compatible_dim:]
+z_f2 = z2[:, compatible_dim:]
+
+a1 = F.normalize(align_head(z_c1), dim=1)
+a2 = F.normalize(align_head(z_c2), dim=1)
+
+with torch.no_grad():
+    t1 = F.normalize(teacher(x1), dim=1)
+    t2 = F.normalize(teacher(x2), dim=1)
+```
+
+Return all of the following from `forward`:
+
+```python
+{
+    "logits": logits,
+    "feats": feats,
+    "z": z,
+    "z_c": z_c,
+    "z_f": z_f,
+}
+```
+
+This keeps the `BaseMethod` interface intact.
+
+---
+
+## 6. Losses
+
+## 6.1 Predictive loss on the full latent
+
+The predictive loss is applied to the **full** student latent:
+
+```python
+z1_full = torch.cat([z_c1, z_f1], dim=1)  # same as z1
+z2_full = torch.cat([z_c2, z_f2], dim=1)  # same as z2
+```
+
+### Minimal implementation
+
+Use plain MSE between the two views:
+
+```python
+L_pred = F.mse_loss(z1_full, z2_full)
+```
+
+### Why this is okay
+
+In LeJEPA, the prediction loss is defined on multiple views. With only two global views and no local views, the full predictive loss is proportional to pairwise MSE between the two view embeddings. So for this repo and this v0 implementation, plain MSE is the correct simple choice.
+
+## 6.2 Teacher loss on `z_c` only
+
+Use normalized MSE to align `z_c` to the frozen teacher:
+
+```python
+L_teacher = 0.5 * (
+    F.mse_loss(a1, t1) +
+    F.mse_loss(a2, t2)
+)
+```
+
+where:
+
+```python
+a1 = F.normalize(align_head(z_c1), dim=1)
+a2 = F.normalize(align_head(z_c2), dim=1)
+t1 = F.normalize(teacher(x1), dim=1)
+t2 = F.normalize(teacher(x2), dim=1)
+```
+
+This is equivalent to cosine alignment up to constants and is easy to implement.
+
+## 6.3 Regularization loss on `z_f` only
+
+Default regularizer:
+
+```python
+L_free = 0.5 * (
+    sigreg(z_f1, global_step=self.global_step, ...) +
+    sigreg(z_f2, global_step=self.global_step, ...)
+)
+```
+
+This is the only regularizer on the free branch in v0.
+
+## 6.4 Total SSL loss
+
+Use the simplest weighted sum:
+
+```python
+L_ssl = (
+    lambda_pred * L_pred
+    + lambda_teacher * L_teacher
+    + lambda_sigreg * L_free
+)
+```
+
+Recommended default weights:
+
+```python
+lambda_pred = 1.0
+lambda_teacher = 1.0
+lambda_sigreg = 0.05
+```
+
+Why these defaults:
+
+- `lambda_pred = 1.0`: keep the full latent predictive task as the anchor loss,
+- `lambda_teacher = 1.0`: teacher supervision should matter from the start,
+- `lambda_sigreg = 0.05`: consistent with LeJEPA-style regularization magnitude for a first pass.
+
+### Final training loss returned by the method
+
+Keep the repo behavior:
+
+```python
+total = L_ssl + class_loss + projector_class_loss
+```
+
+where:
+
+- `class_loss` comes from the online encoder classifier already in `BaseMethod`,
+- `projector_class_loss` is optional and uses the full `z`.
+
+---
+
+## 7. What is explicitly **not** in v0
+
+Do not implement any of the following in the first pass:
+
+```text
+- no relation loss
+- no teacher-view averaging
+- no z_c / z_f decorrelation
+- no orthogonality penalty on align_head
+- no EMA teacher
+- no teacher schedule
+- no separate projector trunks/heads
+- no RDMReg
+- no final ReLU on z
+```
+
+The first version should be the smallest possible method that tests the core idea.
+
+---
+
+## 8. SIGReg pseudocode (LeJEPA-style)
+
+This section should be implemented as a standalone utility so it can be reused later.
+
+## 8.1 Interface
+
+```python
+def sigreg(
+    x: torch.Tensor,
+    global_step: int,
+    num_slices: int = 256,
+    num_points: int = 17,
+    t_min: float = -5.0,
+    t_max: float = 5.0,
+    ddp_sync: bool = True,
+) -> torch.Tensor:
+    ...
+```
+
+Input:
+
+- `x`: shape `[N, K]`
+- returns: scalar loss
+
+## 8.2 Paper-aligned pseudocode
+
+This is the LeJEPA Algorithm 1 logic adapted to the repo style.
+
+```python
+def sigreg(x, global_step, num_slices=256, num_points=17, t_min=-5.0, t_max=5.0):
+    # x: [N, K]
+    device = x.device
+    dtype = x.dtype
+
+    # 1. sample random unit directions, seeded by global_step
+    g = torch.Generator(device=device)
+    g.manual_seed(int(global_step))
+    A = torch.randn(x.size(1), num_slices, generator=g, device=device, dtype=dtype)
+    A = F.normalize(A, dim=0)                         # [K, M]
+
+    # 2. integration points for the characteristic function test
+    t = torch.linspace(t_min, t_max, num_points, device=device, dtype=dtype)   # [T]
+
+    # 3. target characteristic function for N(0, 1)
+    target_cf = torch.exp(-0.5 * t.square())         # [T]
+
+    # 4. empirical characteristic function on projected samples
+    #    projected: [N, M]
+    projected = x @ A
+    projected_t = projected.unsqueeze(-1) * t.view(1, 1, -1)   # [N, M, T]
+
+    ecf = torch.exp(1j * projected_t).mean(dim=0)    # [M, T]
+
+    # 5. DDP average if needed
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(ecf, op=torch.distributed.ReduceOp.SUM)
+        ecf = ecf / torch.distributed.get_world_size()
+        world_size = torch.distributed.get_world_size()
+    else:
+        world_size = 1
+
+    # 6. weighted L2 distance between empirical and target characteristic functions
+    err = (ecf - target_cf.view(1, -1)).abs().square() * target_cf.view(1, -1)
+
+    # 7. integrate over t, then average over slices
+    per_slice = torch.trapz(err, t, dim=-1) * (x.size(0) * world_size)   # [M]
+    return per_slice.mean()
+```
+
+## 8.3 Safer real-valued version
+
+If complex autograd causes issues under AMP, use the equivalent real-valued form:
+
+```python
+def sigreg_real(x, global_step, num_slices=256, num_points=17, t_min=-5.0, t_max=5.0):
+    device = x.device
+    dtype = x.dtype
+
+    g = torch.Generator(device=device)
+    g.manual_seed(int(global_step))
+    A = torch.randn(x.size(1), num_slices, generator=g, device=device, dtype=dtype)
+    A = F.normalize(A, dim=0)
+
+    t = torch.linspace(t_min, t_max, num_points, device=device, dtype=dtype)
+    target_cf = torch.exp(-0.5 * t.square())
+
+    projected = x @ A
+    projected_t = projected.unsqueeze(-1) * t.view(1, 1, -1)
+
+    ecf_real = torch.cos(projected_t).mean(dim=0)
+    ecf_imag = torch.sin(projected_t).mean(dim=0)
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(ecf_real, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(ecf_imag, op=torch.distributed.ReduceOp.SUM)
+        world_size = torch.distributed.get_world_size()
+        ecf_real = ecf_real / world_size
+        ecf_imag = ecf_imag / world_size
+    else:
+        world_size = 1
+
+    err = ((ecf_real - target_cf.view(1, -1)) ** 2 + ecf_imag ** 2) * target_cf.view(1, -1)
+    per_slice = torch.trapz(err, t, dim=-1) * (x.size(0) * world_size)
+    return per_slice.mean()
+```
+
+### Recommendation
+
+Start with the complex version. If AMP or complex dtype causes headaches, switch to `sigreg_real`.
+
+---
+
+## 9. Repo changes
+
+## 9.1 New files
 
 Add:
 
 ```text
-scripts/pretrain/imagenet/split_align_rectified_lpjepa_imagenet.yaml
+solo/losses/sigreg.py
+solo/losses/split_teacher_sigjepa.py
+solo/utils/teacher.py
+solo/methods/split_teacher_sigjepa.py
+scripts/pretrain/imagenet-100/split_teacher_sigjepa_imagenet100.yaml
 ```
 
-If you prefer consistency with the existing directory style, put it under a new ImageNet-1K folder and keep the old ImageNet-100 config untouched.
+## 9.2 File responsibilities
+
+### `solo/losses/sigreg.py`
+
+Contains only SIGReg-related helpers:
+
+- `sample_unit_sphere(...)`
+- `sigreg(...)`
+- `sigreg_real(...)`
+
+Keep this file independent from the rest of the method.
+
+### `solo/losses/split_teacher_sigjepa.py`
+
+Contains only simple pure loss functions:
+
+- `predictive_loss(z1, z2)`
+- `teacher_alignment_loss(a1, a2, t1, t2)`
+- `free_regularization_loss(z_f1, z_f2, ...)`
+- `split_teacher_sigjepa_loss(...)`
+
+Make sure these are plain functions, not methods.
+
+### `solo/utils/teacher.py`
+
+Contains a tiny frozen teacher wrapper:
+
+- load teacher from checkpoint or timm,
+- expose `forward(x) -> [B, teacher_dim]`,
+- stay in `eval()` and `no_grad()`.
+
+### `solo/methods/split_teacher_sigjepa.py`
+
+Implements the actual method class.
+
+### `scripts/pretrain/imagenet-100/split_teacher_sigjepa_imagenet100.yaml`
+
+Contains the v0 training config.
 
 ---
 
-## 8. Recommended config skeleton
+## 10. Method implementation details
+
+## 10.1 Method class skeleton
+
+Implement a new method class:
+
+```python
+class SplitTeacherSIGJEPA(BaseMethod):
+    ...
+```
+
+Do **not** subclass `RectifiedLpJEPA` in v0. Subclass `BaseMethod` directly.
+
+Reason:
+
+- the new method does not use RDMReg,
+- it does not use rectified targets,
+- it should have the smallest possible dependency surface.
+
+## 10.2 Learnable modules
+
+The method should create exactly these trainable modules:
+
+```python
+self.projector
+self.align_head
+self.projector_classifier   # only if enabled
+```
+
+The teacher is **not** trainable.
+
+## 10.3 Learnable params property
+
+Return:
+
+```python
+super().learnable_params + [
+    {"name": "projector", "params": self.projector.parameters()},
+    {"name": "align_head", "params": self.align_head.parameters()},
+]
+```
+
+Add projector classifier params if needed using the repo’s existing pattern.
+
+---
+
+## 11. Forward function pseudocode
+
+```python
+def forward(self, X):
+    out = super().forward(X)
+    z = self.projector(out["feats"])
+
+    z_c = z[:, : self.compatible_dim]
+    z_f = z[:, self.compatible_dim :]
+
+    out.update({
+        "z": z,
+        "z_c": z_c,
+        "z_f": z_f,
+    })
+
+    if self.projector_classifier is not None:
+        out["projector_logits"] = self.projector_classifier(z.detach())
+
+    return out
+```
+
+---
+
+## 12. Training step pseudocode
+
+```python
+def training_step(self, batch, batch_idx):
+    out = super().training_step(batch, batch_idx)
+    class_loss = out["loss"]
+
+    z1, z2 = out["z"]
+    z_c1, z_c2 = out["z_c"]
+    z_f1, z_f2 = out["z_f"]
+
+    _, X, targets = batch
+    X = [X] if isinstance(X, torch.Tensor) else X
+    x1, x2 = X[:2]
+
+    a1 = F.normalize(self.align_head(z_c1), dim=1)
+    a2 = F.normalize(self.align_head(z_c2), dim=1)
+
+    with torch.no_grad():
+        t1 = F.normalize(self.teacher(x1), dim=1)
+        t2 = F.normalize(self.teacher(x2), dim=1)
+
+    ssl_loss, pred_loss, teacher_loss, free_loss = split_teacher_sigjepa_loss(
+        z1=z1,
+        z2=z2,
+        a1=a1,
+        a2=a2,
+        t1=t1,
+        t2=t2,
+        z_f1=z_f1,
+        z_f2=z_f2,
+        global_step=self.global_step,
+        lambda_pred=self.lambda_pred,
+        lambda_teacher=self.lambda_teacher,
+        lambda_sigreg=self.lambda_sigreg,
+        num_slices=self.sigreg_num_slices,
+        num_points=self.sigreg_num_points,
+        t_min=self.sigreg_t_min,
+        t_max=self.sigreg_t_max,
+    )
+
+    projector_class_loss = torch.tensor(0.0, device=self.device)
+    if self.projector_classifier is not None:
+        proj_metrics1 = self._projector_classifier_step(z1, targets)
+        proj_metrics2 = self._projector_classifier_step(z2, targets)
+        if proj_metrics1 and proj_metrics2:
+            projector_class_loss = 0.5 * (proj_metrics1["proj_loss"] + proj_metrics2["proj_loss"])
+            self.log("train_proj_loss", projector_class_loss, on_epoch=True, sync_dist=True)
+            self.log("train_proj_acc1", 0.5 * (proj_metrics1["proj_acc1"] + proj_metrics2["proj_acc1"]), on_epoch=True, sync_dist=True)
+
+    self.log("train_split_teacher_sigjepa_loss", ssl_loss, on_epoch=True, sync_dist=True)
+    self.log("train_pred_loss", pred_loss, on_epoch=True, sync_dist=True)
+    self.log("train_teacher_loss", teacher_loss, on_epoch=True, sync_dist=True)
+    self.log("train_sigreg_loss", free_loss, on_epoch=True, sync_dist=True)
+    self.log("train_teacher_cosine", 0.5 * ((a1 * t1).sum(dim=1).mean() + (a2 * t2).sum(dim=1).mean()), on_epoch=True, sync_dist=True)
+
+    return ssl_loss + class_loss + projector_class_loss
+```
+
+---
+
+## 13. Config skeleton
 
 ```yaml
-name: "split-align-rectified-lpjepa-imagenet1k"
-method: "split_align_rectified_lpjepa"
+name: "split-teacher-sigjepa-imagenet100"
+method: "split_teacher_sigjepa"
+
 backbone:
   name: "resnet50"
 
@@ -562,50 +658,69 @@ method_kwargs:
   compatible_dim: 512
   free_dim: 1536
 
-  target_distribution: "rectified_lp_distribution"
-  lp_norm_parameter: 1.0
-  mean_shift_value: -1.0
-  mode_of_sigma: "sigma_GN"
+  lambda_pred: 1.0
+  lambda_teacher: 1.0
+  lambda_sigreg: 0.05
 
-  invariance_loss_weight: 25.0
-  rdm_reg_loss_weight: 125.0
-  align_instance_weight: 10.0
-  align_relation_weight: 1.0
-  branch_decorr_weight: 0.05
-  compatible_var_weight: 5.0
-  compatible_var_gamma: 1.0
-  orth_weight: 1.0e-3
-
-  num_projections: 8192
-  projection_vectors_type: "random"
-
-  align_schedule: "late_cosine_decay"
-  align_decay_start_pct: 0.6
-  align_decay_end_weight: 0.2
+  sigreg_num_slices: 256
+  sigreg_num_points: 17
+  sigreg_t_min: -5.0
+  sigreg_t_max: 5.0
+  sigreg_use_real: false
 
   teacher_source: "checkpoint"
   teacher_ckpt_path: "/path/to/teacher.ckpt"
-  teacher_feature_key: "feats"
-  teacher_pooling: "global"
-  teacher_normalize: true
-  teacher_target_mode: "view_average"
+  teacher_name: null
+  teacher_feature_key: null
+  teacher_output_dim: null
 
+  projector_type: "mlp"
   add_projector_classifier: true
   logging_interval: 50
 
 data:
-  dataset: imagenet
-  train_path: "/path/to/imagenet/train"
-  val_path: "/path/to/imagenet/val"
-  preload: false
-  format: image_folder
-  num_workers: 16
+  dataset: imagenet100
+  train_path: "/imagenet100_real/train"
+  val_path: "/imagenet100_real/val"
+  preload: true
+  format: "image_folder"
+  num_workers: 8
+
+augmentations:
+  - rrc:
+      enabled: true
+      crop_min_scale: 0.2
+      crop_max_scale: 1.0
+    color_jitter:
+      enabled: true
+      brightness: 0.4
+      contrast: 0.4
+      saturation: 0.2
+      hue: 0.1
+      prob: 0.8
+    grayscale:
+      enabled: true
+      prob: 0.2
+    gaussian_blur:
+      enabled: true
+      prob: 0.5
+    solarization:
+      enabled: true
+      prob: 0.1
+    equalization:
+      enabled: false
+      prob: 0.0
+    horizontal_flip:
+      enabled: true
+      prob: 0.5
+    crop_size: 224
+    num_crops: 2
 
 optimizer:
-  name: lars
+  name: "adamw"
   batch_size: 128
-  lr: 0.165
-  classifier_lr: 0.055
+  lr: 0.0825
+  classifier_lr: 0.0275
   weight_decay: 1e-4
   kwargs:
     clip_lr: true
@@ -613,376 +728,314 @@ optimizer:
     exclude_bias_n_norm: true
 
 scheduler:
-  name: warmup_cosine
+  name: "warmup_cosine"
 
 max_epochs: 1000
+devices: [0]
 sync_batchnorm: true
-accelerator: gpu
-strategy: ddp
+accelerator: "gpu"
+strategy: "ddp"
 precision: 16-mixed
 ```
 
 ---
 
-## 9. Pseudocode for `training_step`
+## 14. Benchmarks and baselines
 
-```python
-def training_step(self, batch, batch_idx):
-    out = super().training_step(batch, batch_idx)
-    class_loss = out["loss"]
+The benchmark suite should answer two questions:
 
-    x1, x2 = out["X"]               # or unpack original views from batch pipeline
-    z_c1, z_c2 = out["z_c"]
-    z_f1, z_f2 = out["z_f"]
-    z1, z2     = out["z"]
+1. does splitting help over full-latent distillation?
+2. does SIGReg on `z_f` help over teacher-only JEPA distillation?
 
-    proj_vecs = Projections.get_projection_vectors(
-        z_f1, z_f2,
-        self.num_projections,
-        self.projection_vectors_type,
-        self.free_dim,
-    )
+## 14.1 Primary metrics
 
-    with torch.no_grad():
-        t1 = F.normalize(self.teacher(x1), dim=1)
-        t2 = F.normalize(self.teacher(x2), dim=1)
-        t_bar = F.normalize((t1 + t2) / 2, dim=1)
+For every run, report:
 
-    a1 = F.normalize(self.align_head(self.compat_ln(z_c1)), dim=1)
-    a2 = F.normalize(self.align_head(self.compat_ln(z_c2)), dim=1)
+- ImageNet-100 linear probe top-1 on **encoder features**,
+- ImageNet-100 linear probe top-1 on **projector features**,
+- teacher-student cosine on `z_c`,
+- average `SIGReg(z_f)`,
+- train wall-clock time,
+- peak GPU memory,
+- optional kNN accuracy if already wired in the repo.
 
-    loss, logs = split_align_rectified_lp_jepa_loss(
-        z_c1, z_c2,
-        z_f1, z_f2,
-        a1, a2,
-        t_bar,
-        self.align_head.weight,
-        proj_vecs,
-        epoch=self.current_epoch,
-        max_epochs=self.trainer.max_epochs,
-        ...
-    )
+## 14.2 Secondary transfer metrics
 
-    projector_class_loss = 0.0
-    if self.projector_classifier is not None:
-        projector_class_loss = projector_probe_loss(z1, z2, targets)
+Reuse the repo transfer protocol where possible:
 
-    total = loss + class_loss + projector_class_loss
-    self.log_dict(logs, on_epoch=True, sync_dist=True)
-    return total
+- DTD
+- CIFAR-10
+- CIFAR-100
+- Flowers102
+- Food101
+- Pets
+
+Run frozen-feature linear probing on both encoder and projector features if compute allows.
+
+## 14.3 Baselines to run in the same repo
+
+### B0. Existing repo baseline
+
+- `rectified_lpjepa`
+- unchanged
+
+This is the current codebase baseline.
+
+### B1. Plain SIGReg JEPA (no teacher, no split)
+
+Use the same projector and predictive loss, but regularize the **full** latent `z` with SIGReg:
+
+```text
+L = pred(z) + sigreg(z)
 ```
 
-Key implementation detail: generate projection vectors from `z_f` only, because only the free branch is distribution-matched.
+Method name suggestion:
+
+`sigjepa`
+
+This isolates the effect of splitting and teacher alignment.
+
+### B2. Full-latent teacher baseline
+
+No split. Align the **full** latent to the teacher:
+
+```text
+L = pred(z) + teacher(z)
+```
+
+Method name suggestion:
+
+`teacher_jepa_full`
+
+This is the most important distillation baseline.
+
+### B3. Full-latent teacher + SIGReg baseline
+
+No split. Teacher + SIGReg on the full latent:
+
+```text
+L = pred(z) + teacher(z) + sigreg(z)
+```
+
+Method name suggestion:
+
+`teacher_sigjepa_full`
+
+### B4. Split, no teacher
+
+Keep the split, but set `lambda_teacher = 0`:
+
+```text
+L = pred(cat(z_c, z_f)) + sigreg(z_f)
+```
+
+This tests whether the free branch alone already helps.
+
+### B5. Split, no SIGReg
+
+Keep the split, but set `lambda_sigreg = 0`:
+
+```text
+L = pred(cat(z_c, z_f)) + teacher(z_c)
+```
+
+This tests whether the free branch needs explicit regularization.
+
+### B6. Proposed method
+
+```text
+L = pred(cat(z_c, z_f)) + teacher(z_c) + sigreg(z_f)
+```
+
+This is the main method.
+
+## 14.4 Optional teacher-source comparison
+
+If multiple teacher checkpoints are available, rerun B2/B3/B6 with:
+
+- large JEPA teacher,
+- DINO-style teacher,
+- other frozen foundation model teacher.
+
+Keep the student, budget, and hyperparameters unchanged.
 
 ---
 
-## 10. Logging and diagnostics
+## 15. Minimal ablation grid
 
-Log all current baseline metrics, plus these new ones:
+Keep the grid small.
 
-### Core loss terms
+## 15.1 Split size
 
-- `train_split_align_total_loss`
-- `train_invariance_loss`
-- `train_free_rdm_loss`
-- `train_align_instance_loss`
-- `train_align_relation_loss`
-- `train_branch_decorr_loss`
-- `train_compatible_var_loss`
-- `train_orth_loss`
-- `train_align_schedule_weight`
+```text
+compatible_dim/free_dim:
+256 / 1792
+512 / 1536   <-- default
+1024 / 1024
+```
 
-### Alignment health
+## 15.2 Teacher weight
 
-- `train_teacher_student_cosine`
-- `train_teacher_relation_mse`
-- `train_align_head_fro_norm`
-- `train_align_head_orth_gap = ||W^T W - I||_F`
+```text
+lambda_teacher in {0.5, 1.0, 2.0}
+```
 
-### Sparsity
+## 15.3 SIGReg weight
 
-Log separately for `z_f` and full `z`:
+```text
+lambda_sigreg in {0.01, 0.05, 0.1}
+```
 
-- `train_l0_sparsity_metric_zf`
-- `train_l1_sparsity_metric_zf`
-- `train_l0_sparsity_metric_full`
-- `train_l1_sparsity_metric_full`
+## 15.4 SIGReg slices
 
-### Collapse / redundancy checks
+```text
+num_slices in {64, 256, 1024}
+```
 
-- `train_variance_loss_zc`
-- `train_covariance_loss_zc`
-- `train_crosscov_zc_zf`
-- optional: `train_nhsic_zc_zf`
-
-### Online classifier
-
-Keep existing:
-
-- `train_proj_loss`
-- `train_proj_acc1`
+Do not sweep more than this in the first pass.
 
 ---
 
-## 11. Reduction tests that should hold
+## 16. Logging
 
-These are extremely useful for debugging.
+Log these every epoch:
 
-### Test A: baseline recovery
+```text
+train_split_teacher_sigjepa_loss
+train_pred_loss
+train_teacher_loss
+train_sigreg_loss
+train_teacher_cosine
+train_zc_norm
+train_zf_norm
+train_proj_loss
+train_proj_acc1
+```
+
+Recommended extra diagnostics:
+
+```text
+train_var_zc
+train_var_zf
+train_cov_full_z
+train_sigreg_zf1
+train_sigreg_zf2
+```
+
+Do not add too many custom diagnostics in v0.
+
+---
+
+## 17. Sanity checks
+
+## 17.1 Reduction checks
+
+### Check A: no compatible branch
 
 Set:
 
-- `compatible_dim = 0`
-- `free_dim = 2048`
-- all teacher losses off
+```text
+compatible_dim = 0
+free_dim = 2048
+lambda_teacher = 0
+```
 
-Then the method should reduce to the current Rectified LpJEPA baseline.
+This should reduce to plain full-latent SIGReg JEPA.
 
-### Test B: pure teacher-aligned student
-
-Set:
-
-- `free_dim = 0`
-- `compatible_dim = 2048`
-- `lambda_rdm = 0`
-
-Then the method becomes a teacher-aligned JEPA without sparse free branch.
-
-### Test C: split but no teacher
+### Check B: no free branch
 
 Set:
 
-- `lambda_inst = 0`
-- `lambda_rel = 0`
+```text
+compatible_dim = 2048
+free_dim = 0
+lambda_sigreg = 0
+```
 
-Then `z_c` and `z_f` should still train without numerical issues, and `z_f` should keep the expected sparsity pattern.
+This should reduce to full-latent teacher JEPA.
 
-### Test D: orthogonality off
+### Check C: split but no teacher
 
 Set:
 
-- `lambda_orth = 0`
+```text
+lambda_teacher = 0
+```
 
-This should still train. If not, the issue is not the orthogonality term.
+The method should still train normally.
 
----
+### Check D: split but no SIGReg
 
-## 12. Main ablation grid
+Set:
 
-Run the ablations in this order.
+```text
+lambda_sigreg = 0
+```
 
-## 12.1 Minimal paper grid
+The method should still train normally.
 
-| ID | Variant | Change from full method | Purpose |
-|---|---|---|---|
-| A0 | Rectified LpJEPA baseline | no teacher, no split | base repo baseline |
-| A1 | Full-latent alignment baseline | align all 2048 dims, no split | test if splitting matters |
-| A2 | Split, no decouple | `lambda_dec = 0` | test whether branches collapse into each other |
-| A3 | Split, no relation | `lambda_rel = 0` | test geometry matching vs instance-only |
-| A4 | Split, no late decay | constant alignment weight | test if late relaxation matters |
-| A5 | Full SA-RLpJEPA | default settings | main result |
+## 17.2 Shape assertions
 
-## 12.2 Split-size ablation
+Add explicit assertions in the method init:
 
-Hold everything else fixed.
+```python
+assert compatible_dim > 0
+assert free_dim > 0
+assert compatible_dim + free_dim == proj_output_dim
+```
 
-| ID | `D_c` | `D_f` |
-|---|---:|---:|
-| S1 | 256 | 1792 |
-| S2 | 512 | 1536 |
-| S3 | 1024 | 1024 |
-
-Expectation:
-
-- too-small `D_c` underfits teacher semantics,
-- too-large `D_c` reduces the value of the free sparse branch.
-
-## 12.3 Free-branch sparsity ablation
-
-Use `sigma_GN` throughout.
-
-| ID | `p` | `mu` |
-|---|---:|---:|
-| F1 | 1.0 | 0.0 |
-| F2 | 1.0 | -1.0 |
-| F3 | 1.0 | -2.0 |
-| F4 | 2.0 | 0.0 |
-| F5 | 2.0 | -1.0 |
-| F6 | 2.0 | -2.0 |
-
-Recommended default for the full method: **F2**.
-
-## 12.4 Projection-vector ablation
-
-| ID | Projection type | Purpose |
-|---|---|---|
-| P1 | `random` | lowest engineering risk |
-| P2 | `torch_svd_bottom_half_eigen_and_random` | test faster convergence on `z_f` |
-| P3 | `torch_svd_and_random` | stronger eigendirection matching |
-
-Start with `random`. Move to `bottom_half_eigen_and_random` only after the full method is stable.
-
-## 12.5 Teacher-target ablation
-
-| ID | Target mode |
-|---|---|
-| T1 | per-view teacher target |
-| T2 | view-averaged teacher target |
-
-Recommended default: **T2**.
+Also assert teacher dim once inferred.
 
 ---
 
-## 13. What to report
+## 18. Recommended execution order
 
-For every main run, report:
+### Phase 1: implementation smoke test
 
-1. **ImageNet-1K linear probe top-1** on
-   - encoder features,
-   - full projector features `z`.
-2. **Sparsity**
-   - `l0`, `l1` on `z_f`,
-   - `l0`, `l1` on full `z`.
-3. **Teacher agreement**
-   - mean cosine between `a` and teacher target,
-   - relation loss / Gram matching error.
-4. **Branch separation**
-   - cross-covariance between `z_c` and `z_f`.
-5. **Training cost**
-   - images/sec,
-   - peak GPU memory,
-   - wall clock overhead vs baseline Rectified LpJEPA.
+Run for `10` to `20` epochs on ImageNet-100 with:
 
-Nice-to-have:
+- `compatible_dim = 512`
+- `free_dim = 1536`
+- `lambda_pred = 1.0`
+- `lambda_teacher = 1.0`
+- `lambda_sigreg = 0.05`
+- `num_slices = 64`
 
-- k-NN retrieval on ImageNet-1K val,
-- few-shot transfer on the same downstream suite used by the paper,
-- nearest-neighbor visualizations comparing `z_c` vs `z_f` vs `z`.
+Goal: verify shapes, DDP, AMP, teacher loading, and logs.
 
----
+### Phase 2: short benchmark
 
-## 14. Practical implementation notes
+Run `100` epochs for:
 
-### 14.1 Keep the teacher simple
+- B1 plain SIGReg JEPA
+- B2 full teacher
+- B5 split no SIGReg
+- B6 proposed
 
-The teacher path should be frozen, single-vector, and global. Do not add token-level distillation in v1.
+Goal: confirm the split design is worth pursuing.
 
-### 14.2 Do not put RDMReg on `z_c`
+### Phase 3: full benchmark
 
-That defeats the purpose of having a teacher-compatible subspace.
+Run `1000` epochs for:
 
-### 14.3 Do not ReLU the concatenated latent
-
-Only `z_f` should be rectified. `z_c` should remain signed.
-
-### 14.4 Teacher forward should be cheap
-
-Use:
-
-- `torch.no_grad()`
-- `autocast`
-- `eval()`
-
-and keep the teacher outside the optimizer.
-
-### 14.5 Start with random projections
-
-Even though the paper showed useful eigenvector-based projections, the cheapest first implementation on ImageNet-1K should keep `projection_vectors_type = random`.
+- B0 to B6
+- split-size sweep
+- small teacher-weight and SIGReg-weight sweeps
 
 ---
 
-## 15. Failure modes and fixes
+## 19. Bottom line
 
-### Failure mode: `z_f` stops being sparse
+The **only** thing v0 should test is:
 
-Likely causes:
+> Can a student latent be split into a teacher-compatible subspace `z_c` and a free subspace `z_f`, with teacher loss on `z_c`, SIGReg on `z_f`, and JEPA predictive loss on the full concatenated latent?
 
-- teacher alignment too strong,
-- `D_c` too large,
-- `mu` not negative enough.
+If this minimal version works, then later versions can add:
 
-Fixes:
+- relation matching,
+- decoupling losses,
+- schedules,
+- better teacher targets,
+- more structured split heads.
 
-- lower `lambda_inst`,
-- start decay earlier (`0.5E` instead of `0.6E`),
-- try `mu = -2`.
-
-### Failure mode: `z_c` collapses / low rank
-
-Likely causes:
-
-- compatible branch too small,
-- no variance floor,
-- relation loss off.
-
-Fixes:
-
-- increase `lambda_var`,
-- turn on relation loss,
-- move from `D_c = 256` to `512`.
-
-### Failure mode: `z_c` and `z_f` become redundant
-
-Fixes:
-
-- raise `lambda_dec`,
-- lower `D_c`,
-- decay teacher alignment slightly earlier.
-
-### Failure mode: relation loss unstable
-
-Fixes:
-
-- compute on view-averaged normalized features,
-- remove diagonal before Frobenius norm,
-- warm up relation loss for first 10 epochs if needed.
-
----
-
-## 16. Recommended execution plan
-
-### Phase 1: smoke test
-
-- ImageNet-100 or a 100-class ImageNet-1K subset
-- `100 epochs`
-- `D_c=512`, `D_f=1536`
-- `p=1`, `mu=-1`
-- random projections
-- teacher instance loss on, relation loss off
-
-Goal: confirm the split implementation is numerically sound.
-
-### Phase 2: main ImageNet-1K sweep
-
-Run:
-
-- A0, A1, A5
-- split-size ablation S1–S3
-- sparsity ablation F1–F6
-
-### Phase 3: cleanup ablations
-
-Run:
-
-- A2, A3, A4
-- projection ablation P1–P3
-- teacher-target ablation T1–T2
-
----
-
-## 17. Bottom line
-
-The full method to implement is:
-
-- **teacher-aligned small compatible branch** `z_c`,
-- **sparse rectified free branch** `z_f`,
-- **RDMReg only on `z_f`**,
-- **teacher instance + relation alignment only on `z_c`**,
-- **explicit cross-branch decorrelation**,
-- **late decay of alignment strength**.
-
-If this works, the strongest paper claim is not just "teacher distillation helps," but:
-
-> a JEPA student should not be forced to devote its entire latent to the teacher; the best trade-off comes from reserving a small teacher-compatible subspace and a larger sparse free subspace.
-
-That claim is novel, cleanly testable, and well matched to the current Rectified LpJEPA codebase.
+But none of those belong in the first implementation.

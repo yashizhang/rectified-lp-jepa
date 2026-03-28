@@ -4,5 +4,5 @@ python3 main_pretrain.py \
   --config-name=rectified_lpjepa_imagenet.yaml \
   ++wandb.entity=yashi-zhang \
   ++wandb.project=jepa \
-  ++wandb.enabled=false # set to false for debugging
+  ++wandb.enabled=true # set to false for debugging
 ```
