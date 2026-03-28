@@ -237,3 +237,5 @@ data/
 !solo/data/
 !scripts/pretrain/cifar/wandb/
 !scripts/pretrain/imagenet-100/wandb/
+
+uv.lock
