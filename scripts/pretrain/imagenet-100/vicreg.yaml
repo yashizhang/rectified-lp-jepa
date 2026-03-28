@@ -25,10 +25,8 @@ method_kwargs:
   add_projector_classifier: True
 data:
   dataset: imagenet100
-  train_path: "/imagenet100_real/train" # yash change temprorary to see if this works
-  val_path: "/imagenet100_real/val" # absolute path into squashfs overlay
-  # train_path: "./datasets/imagenet-100/train"
-  # val_path: "./datasets/imagenet-100/val"
+  train_path: "./datasets/imagenet100/train"
+  val_path: "./datasets/imagenet100/val"
   preload: True  # This enables the in-memory cache
   format: "image_folder"
   num_workers: 4

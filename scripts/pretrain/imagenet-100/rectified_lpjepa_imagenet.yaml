@@ -36,11 +36,11 @@ mlp_probe:
 
 data:
   dataset: imagenet100
-  train_path: "/imagenet100_real/train"
-  val_path: "/imagenet100_real/val"
-  preload: True
+  train_path: "./datasets/imagenet100/train"
+  val_path: "./datasets/imagenet100/val"
+  preload: False
   format: "image_folder"
-  num_workers: 8
+  num_workers: 6
 
 augmentations:
   - rrc:
@@ -96,5 +96,5 @@ max_epochs: 1000
 devices: [0]
 sync_batchnorm: True
 accelerator: "gpu"
-strategy: "ddp"
+strategy: "auto"
 precision: 16-mixed

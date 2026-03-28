@@ -30,10 +30,8 @@ mlp_probe:
 
 data:
   dataset: imagenet100
-  train_path: "/imagenet100_real/train" # yash change temprorary to see if this works
-  val_path: "/imagenet100_real/val" # absolute path into squashfs overlay
-  # train_path: "./datasets/imagenet100/train"
-  # val_path: "./datasets/imagenet100/val"
+  train_path: "./datasets/imagenet100/train"
+  val_path: "./datasets/imagenet100/val"
   preload: True  # This enables the in-memory cache
   format: "image_folder"
   num_workers: 4

@@ -1,118 +1,85 @@
-import os, sys
+import argparse
+import os
+from pathlib import Path
 
-# usage: python make_imagenet100.py full/imagenet/path desired/imagenet100/path
-full_imagenet_path = sys.argv[1]
-imagenet100_path = sys.argv[2]
 
-class_names = [
-    "n02869837",
-    "n01749939",
-    "n02488291",
-    "n02107142",
-    "n13037406",
-    "n02091831",
-    "n04517823", # vacuum cleaner
-    "n04589890", # window screen
-    "n03062245",
-    "n01773797",
-    "n01735189",
-    "n07831146",
-    "n07753275",
-    "n03085013",
-    "n04485082",
-    "n02105505",
-    "n01983481",
-    "n02788148",
-    "n03530642",
-    "n04435653",
-    "n02086910",
-    "n02859443",
-    "n13040303",
-    "n03594734",
-    "n02085620", # Chihuahua
-    "n02099849",
-    "n01558993",
-    "n04493381",
-    "n02109047",
-    "n04111531",
-    "n02877765",
-    "n04429376",
-    "n02009229",
-    "n01978455",
-    "n02106550",
-    "n01820546",
-    "n01692333",
-    "n07714571",
-    "n02974003",
-    "n02114855",
-    "n03785016",
-    "n03764736",
-    "n03775546",
-    "n02087046",
-    "n07836838",
-    "n04099969",
-    "n04592741",
-    "n03891251",
-    "n02701002",
-    "n03379051",
-    "n02259212",
-    "n07715103",
-    "n03947888", # pirate ship
-    "n04026417",
-    "n02326432",
-    "n03637318",
-    "n01980166",
-    "n02113799",
-    "n02086240",
-    "n03903868",
-    "n02483362",
-    "n04127249",
-    "n02089973",
-    "n03017168",
-    "n02093428",
-    "n02804414",
-    "n02396427",
-    "n04418357",
-    "n02172182",
-    "n01729322",
-    "n02113978",
-    "n03787032",
-    "n02089867",
-    "n02119022",
-    "n03777754",
-    "n04238763",
-    "n02231487",
-    "n03032252",
-    "n02138441",
-    "n02104029",
-    "n03837869",
-    "n03494278",
-    "n04136333",
-    "n03794056",
-    "n03492542",
-    "n02018207",
-    "n04067472",
-    "n03930630",
-    "n03584829",
-    "n02123045", # tabby cat
-    "n04229816",
-    "n02100583",
-    "n03642806", # laptop
-    "n04336792",
-    "n03259280",
-    "n02116738", # American Hunting Dog
-    "n02108089",
-    "n03424325",
-    "n01855672",
-    "n02090622",
+DEFAULT_SOURCE_CANDIDATES = [
+    os.environ.get("IMAGENET_ROOT"),
+    "/network/datasets/imagenet.var/imagenet_torchvision",
+    "/datasets/imagenet",
+    "/data/imagenet",
 ]
 
-## make a squah file from all these files -- and only include the 100k files -- and directly read it into scratch or in the ram disk -- 
-for subdir in ["train", "val"]:
-    os.makedirs(os.path.join(imagenet100_path, subdir), exist_ok=True)
-    for class_name in class_names:
-        os.symlink(
-            os.path.join(full_imagenet_path, subdir, class_name),
-            os.path.join(imagenet100_path, subdir, class_name),
-            target_is_directory=True,
-        )
+
+def load_imagenet100_classes() -> list[str]:
+    repo_root = Path(__file__).resolve().parents[2]
+    classes_file = repo_root / "solo" / "data" / "dataset_subset" / "imagenet100_classes.txt"
+    return classes_file.read_text().strip().split()
+
+
+def resolve_source_root(explicit_source_root: str | None) -> Path:
+    candidates = [explicit_source_root, *DEFAULT_SOURCE_CANDIDATES]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate_path = Path(candidate).expanduser().resolve()
+        if (candidate_path / "train").is_dir() and (candidate_path / "val").is_dir():
+            return candidate_path
+    raise FileNotFoundError(
+        "Could not find a valid ImageNet root. "
+        "Pass it explicitly or set IMAGENET_ROOT to a directory containing train/ and val/."
+    )
+
+
+def ensure_symlink(source_path: Path, dest_path: Path) -> bool:
+    if dest_path.is_symlink():
+        if dest_path.resolve() == source_path.resolve():
+            return False
+        raise FileExistsError(f"{dest_path} already points to {dest_path.resolve()}, expected {source_path}")
+    if dest_path.exists():
+        raise FileExistsError(f"{dest_path} already exists and is not a symlink")
+    dest_path.symlink_to(source_path, target_is_directory=True)
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Create an ImageNet-100 image-folder dataset using symlinks into a full ImageNet tree."
+    )
+    parser.add_argument(
+        "full_imagenet_path",
+        nargs="?",
+        default=None,
+        help="Path to the full ImageNet root containing train/ and val/.",
+    )
+    parser.add_argument(
+        "imagenet100_path",
+        nargs="?",
+        default="datasets/imagenet100",
+        help="Destination directory for the generated ImageNet-100 tree.",
+    )
+    args = parser.parse_args()
+
+    source_root = resolve_source_root(args.full_imagenet_path)
+    destination_root = Path(args.imagenet100_path).expanduser().resolve()
+    classes = load_imagenet100_classes()
+
+    created = 0
+    for split in ["train", "val"]:
+        split_root = destination_root / split
+        split_root.mkdir(parents=True, exist_ok=True)
+        for class_name in classes:
+            source_path = source_root / split / class_name
+            if not source_path.is_dir():
+                raise FileNotFoundError(f"Missing source class directory: {source_path}")
+            dest_path = split_root / class_name
+            created += int(ensure_symlink(source_path, dest_path))
+
+    print(f"ImageNet root: {source_root}")
+    print(f"ImageNet-100 destination: {destination_root}")
+    print(f"Classes linked: {len(classes)}")
+    print(f"New symlinks created: {created}")
+
+
+if __name__ == "__main__":
+    main()

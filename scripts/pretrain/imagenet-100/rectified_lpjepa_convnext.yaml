@@ -36,8 +36,8 @@ mlp_probe:
 
 data:
   dataset: imagenet100
-  train_path: "/imagenet100_real/train"
-  val_path: "/imagenet100_real/val"
+  train_path: "./datasets/imagenet100/train"
+  val_path: "./datasets/imagenet100/val"
   preload: True
   format: "image_folder"
   num_workers: 4
