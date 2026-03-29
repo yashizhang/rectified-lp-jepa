@@ -93,7 +93,7 @@ auto_resume:
 
 # overwrite PL stuff
 max_epochs: 1000
-devices: [0, 1, 2, 3]
+devices: [0, 1, 2]
 num_nodes: 1
 sync_batchnorm: True
 accelerator: "gpu"

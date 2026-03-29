@@ -1,5 +1,5 @@
 ```
-python3 main_pretrain.py \
+CUDA_VISIBLE_DEVICES=[0,1,2] python3 main_pretrain.py \
   --config-path scripts/pretrain/imagenet-100/ \
   --config-name=rectified_lpjepa_imagenet.yaml \
   ++wandb.entity=yashi-zhang \
