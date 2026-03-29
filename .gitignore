@@ -239,3 +239,5 @@ data/
 !scripts/pretrain/imagenet-100/wandb/
 
 uv.lock
+
+.codex 

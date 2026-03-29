@@ -36,11 +36,11 @@ mlp_probe:
 
 data:
   dataset: imagenet100
-  train_path: "./datasets/imagenet100/train"
-  val_path: "./datasets/imagenet100/val"
+  train_path: "/gpfs/projects/AI4D/core-132/imagenet100/train"
+  val_path: "/gpfs/projects/AI4D/core-132/imagenet100/val"
   preload: True
   format: "image_folder"
-  num_workers: 6
+  num_workers: 8
 
 augmentations:
   - rrc:
@@ -93,8 +93,9 @@ auto_resume:
 
 # overwrite PL stuff
 max_epochs: 1000
-devices: [0]
+devices: [0, 1, 2, 3]
+num_nodes: 1
 sync_batchnorm: True
 accelerator: "gpu"
-strategy: "auto"
+strategy: "ddp"
 precision: 16-mixed
