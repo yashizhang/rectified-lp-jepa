@@ -24,6 +24,7 @@ from solo.utils import (
     metrics,
     misc,
     momentum,
+    teacher,
 )
 
 __all__ = [
@@ -33,6 +34,7 @@ __all__ = [
     "lars",
     "metrics",
     "momentum",
+    "teacher",
 ]
 
 

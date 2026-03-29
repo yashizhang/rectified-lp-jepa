@@ -21,6 +21,7 @@ from solo.methods.simclr import SimCLR
 from solo.methods.vicreg import VICReg
 from solo.methods.rectified_lpjepa import RectifiedLpJEPA
 from solo.methods.ncl import NCL
+from solo.methods.split_teacher_sigjepa import SplitTeacherSIGJEPA
 
 METHODS = {
     # methods
@@ -28,10 +29,12 @@ METHODS = {
     "vicreg": VICReg,
     "rectified_lpjepa": RectifiedLpJEPA,
     "ncl": NCL,
+    "split_teacher_sigjepa": SplitTeacherSIGJEPA,
 }
 __all__ = [
     "SimCLR",
     "VICReg",
     "RectifiedLpJEPA",
     "NCL",
+    "SplitTeacherSIGJEPA",
 ]

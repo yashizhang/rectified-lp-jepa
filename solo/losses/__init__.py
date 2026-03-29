@@ -20,8 +20,13 @@
 from solo.losses.simclr import simclr_loss_func
 from solo.losses.vicreg import vicreg_loss_func
 from solo.losses.rectified_lpjepa import rectified_lp_jepa_loss
+from solo.losses.sigreg import sigreg, sigreg_real
+from solo.losses.split_teacher_sigjepa import split_teacher_sigjepa_loss
 __all__ = [
     "simclr_loss_func",
     "vicreg_loss_func",
     "rectified_lp_jepa_loss",
+    "sigreg",
+    "sigreg_real",
+    "split_teacher_sigjepa_loss",
 ]
