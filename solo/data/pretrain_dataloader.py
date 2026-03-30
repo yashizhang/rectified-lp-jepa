@@ -19,15 +19,18 @@
 
 import os
 import random
+from contextlib import contextmanager
+from multiprocessing import Value
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Type, Union
 
+import numpy as np
 import torch
 import torchvision
 from PIL import Image, ImageFilter, ImageOps
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.dataset import Dataset
 from torchvision import transforms
 from torchvision.datasets import STL10, ImageFolder
@@ -236,6 +239,229 @@ class FullTransformPipeline:
         return "\n".join(str(transform) for transform in self.transforms)
 
 
+_SEED_MASK_64 = (1 << 64) - 1
+
+
+def _mix_seed(base_seed: int, epoch: int, index: int, crop_idx: int) -> int:
+    seed = int(base_seed) & _SEED_MASK_64
+    for value in (epoch, index, crop_idx):
+        value = int(value) & _SEED_MASK_64
+        seed ^= (value + 0x9E3779B97F4A7C15 + ((seed << 6) & _SEED_MASK_64) + (seed >> 2))
+        seed &= _SEED_MASK_64
+    return seed
+
+
+@contextmanager
+def _temporary_random_seed(seed: int):
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    try:
+        yield
+    finally:
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+        torch.random.set_rng_state(torch_state)
+
+
+class IndexedPretrainWrapper(Dataset):
+    """Adds sample indexes and optional deterministic per-(epoch, sample, crop) augmentations."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        transform: Optional[Callable] = None,
+        deterministic: bool = False,
+        deterministic_seed: int = 0,
+    ):
+        self.dataset = dataset
+        self.transform = transform
+        self.deterministic = bool(deterministic)
+        self.deterministic_seed = int(deterministic_seed)
+        self._epoch_ref = Value("i", 0)
+
+        if self.deterministic and self.transform is not None and not isinstance(
+            self.transform, FullTransformPipeline
+        ):
+            raise TypeError(
+                "Deterministic pretrain augmentations require a FullTransformPipeline so crops can "
+                "be seeded independently per (epoch, sample, crop)."
+            )
+
+    def set_epoch(self, epoch: int) -> None:
+        with self._epoch_ref.get_lock():
+            self._epoch_ref.value = int(epoch)
+
+    def get_epoch(self) -> int:
+        return int(self._epoch_ref.value)
+
+    def get_epoch_ref(self):
+        return self._epoch_ref
+
+    def _apply_transform(self, img: Image, index: int):
+        if self.transform is None:
+            return img
+
+        if not self.deterministic:
+            return self.transform(img)
+
+        out = []
+        crop_idx = 0
+        current_epoch = self.get_epoch()
+        for transform in self.transform.transforms:
+            base_transform = getattr(transform, "transform", transform)
+            num_crops = int(getattr(transform, "num_crops", 1))
+            for _ in range(num_crops):
+                seed = _mix_seed(self.deterministic_seed, current_epoch, int(index), crop_idx)
+                with _temporary_random_seed(seed):
+                    out.append(base_transform(img))
+                crop_idx += 1
+        return out
+
+    def __getitem__(self, index):
+        item = self.dataset[index]
+        if isinstance(item, (list, tuple)):
+            img, label = item[0], item[1]
+        else:
+            img, label = item, -1
+
+        img = self._apply_transform(img, index)
+        return (index, img, label)
+
+    def __len__(self):
+        return len(self.dataset)
+
+
+def _extract_labels_for_subset(dataset: Dataset) -> Optional[List[int]]:
+    if isinstance(dataset, CustomDatasetWithoutLabels):
+        return None
+    if hasattr(dataset, "targets"):
+        targets = getattr(dataset, "targets")
+        if targets is None:
+            return None
+        return list(np.asarray(targets).tolist())
+    if hasattr(dataset, "labels"):
+        labels = getattr(dataset, "labels")
+        if labels is None:
+            return None
+        labels = np.asarray(labels)
+        if labels.ndim == 0:
+            return None
+        return list(labels.tolist())
+    if hasattr(dataset, "samples"):
+        return [int(label) for _, label in getattr(dataset, "samples")]
+    if hasattr(dataset, "_data"):
+        return [int(entry[2]) for entry in getattr(dataset, "_data")]
+    return None
+
+
+def _build_subset(dataset: Dataset, data_fraction: float) -> Dataset:
+    if data_fraction <= 0:
+        return dataset
+
+    assert data_fraction < 1, "Only use data_fraction for values smaller than 1."
+    from sklearn.model_selection import train_test_split
+
+    indices = np.arange(len(dataset))
+    labels = _extract_labels_for_subset(dataset)
+    stratify = None
+    if labels is not None:
+        unique_labels = set(labels)
+        if len(unique_labels) > 1 and -1 not in unique_labels:
+            stratify = labels
+
+    subset_indices, _ = train_test_split(
+        indices,
+        train_size=data_fraction,
+        stratify=stratify,
+        random_state=42,
+    )
+    subset_indices = sorted(int(i) for i in subset_indices)
+    return Subset(dataset, subset_indices)
+
+
+def _build_raw_pretrain_dataset(
+    dataset: str,
+    train_data_path: Union[str, Path],
+    data_format: str,
+    no_labels: bool,
+    download: bool,
+) -> Dataset:
+    if dataset in ["cifar10", "cifar100"]:
+        DatasetClass = vars(torchvision.datasets)[dataset.upper()]
+        return DatasetClass(train_data_path, train=True, download=download, transform=None)
+
+    if dataset == "stl10":
+        return STL10(train_data_path, split="train+unlabeled", download=download, transform=None)
+
+    if dataset == "celeba":
+        base_dataset = torchvision.datasets.CelebA(
+            train_data_path,
+            split="train",
+            download=download,
+            transform=None,
+        )
+
+        class CelebARawWithoutLabels(Dataset):
+            def __init__(self, dataset):
+                self.dataset = dataset
+
+            def __getitem__(self, index):
+                img, _ = self.dataset[index]
+                return img, -1
+
+            def __len__(self):
+                return len(self.dataset)
+
+        return CelebARawWithoutLabels(base_dataset)
+
+    if dataset in ["imagenet", "imagenet100", "imagenet10"]:
+        if data_format == "h5":
+            assert _h5_available
+            return H5Dataset(dataset, train_data_path, transform=None)
+        return ImageFolder(train_data_path, transform=None)
+
+    if dataset == "custom":
+        dataset_class = CustomDatasetWithoutLabels if no_labels else ImageFolder
+        return dataset_class(train_data_path, transform=None)
+
+    raise ValueError(f"Unsupported dataset '{dataset}' for deterministic pretrain augmentation mode.")
+
+
+def _prepare_deterministic_dataset(
+    dataset: str,
+    transform: Callable,
+    train_data_path: Union[str, Path],
+    data_format: str,
+    no_labels: bool,
+    download: bool,
+    data_fraction: float,
+    preload: bool,
+    deterministic_seed: int,
+) -> Dataset:
+    base_dataset = _build_raw_pretrain_dataset(
+        dataset=dataset,
+        train_data_path=train_data_path,
+        data_format=data_format,
+        no_labels=no_labels,
+        download=download,
+    )
+    base_dataset = _build_subset(base_dataset, data_fraction)
+    if preload:
+        base_dataset = InMemoryDataset(base_dataset, transform=None, num_workers=16)
+
+    return IndexedPretrainWrapper(
+        base_dataset,
+        transform=transform,
+        deterministic=True,
+        deterministic_seed=deterministic_seed,
+    )
+
+
 def build_transform_pipeline(dataset, cfg):
     """Creates a pipeline of transformations given a dataset and an augmentation Cfg node.
     The node needs to be in the following format:
@@ -361,6 +587,8 @@ def prepare_datasets(
     download: bool = True,
     data_fraction: float = -1.0,
     preload: bool = False,
+    deterministic_augmentations: bool = False,
+    deterministic_augmentations_seed: int = 0,
 ) -> Dataset:
     """Prepares the desired dataset.
 
@@ -381,6 +609,19 @@ def prepare_datasets(
     if train_data_path is None:
         sandbox_folder = Path(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
         train_data_path = sandbox_folder / "datasets"
+
+    if deterministic_augmentations:
+        return _prepare_deterministic_dataset(
+            dataset=dataset,
+            transform=transform,
+            train_data_path=train_data_path,
+            data_format=data_format,
+            no_labels=no_labels,
+            download=download,
+            data_fraction=data_fraction,
+            preload=preload,
+            deterministic_seed=deterministic_augmentations_seed,
+        )
 
     if dataset in ["cifar10", "cifar100"]:
         DatasetClass = vars(torchvision.datasets)[dataset.upper()]
@@ -492,7 +733,12 @@ def prepare_datasets(
 
 
 def prepare_dataloader(
-    train_dataset: Dataset, batch_size: int = 64, num_workers: int = 4
+    train_dataset: Dataset,
+    batch_size: int = 64,
+    num_workers: int = 4,
+    shuffle: bool = True,
+    drop_last: bool = True,
+    pin_memory: bool = True,
 ) -> DataLoader:
     """Prepares the training dataloader for pretraining.
     Args:
@@ -506,9 +752,9 @@ def prepare_dataloader(
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
+        pin_memory=pin_memory,
+        drop_last=drop_last,
     )
     return train_loader

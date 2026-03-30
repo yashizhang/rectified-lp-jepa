@@ -40,6 +40,17 @@ method_kwargs:
   teacher_use_same_views: true
   teacher_eager_load: false
 
+  teacher_prefetch:
+    enabled: false
+    cache_dir: "teacher_prefetch_cache/${name}"
+    num_epochs: ${max_epochs}
+    epoch_mode: "wrap"
+    dtype: "float16"
+    base_seed: ${seed}
+    batch_size: ${optimizer.batch_size}
+    num_workers: ${data.num_workers}
+    overwrite: false
+
   projector_type: "mlp"
   add_projector_classifier: true
   logging_interval: 50

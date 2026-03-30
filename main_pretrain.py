@@ -84,6 +84,13 @@ def main(cfg: DictConfig):
 
     assert cfg.method in METHODS, f"Choose from {METHODS.keys()}"
 
+    use_teacher_prefetch = bool(
+        omegaconf_select(cfg, "method_kwargs.teacher_prefetch.enabled", False)
+    )
+    teacher_prefetch_seed = int(
+        omegaconf_select(cfg, "method_kwargs.teacher_prefetch.base_seed", cfg.seed)
+    )
+
     if cfg.data.num_large_crops != 2:
         assert cfg.method in ["wmse", "mae"]
 
@@ -117,6 +124,12 @@ def main(cfg: DictConfig):
         )
 
     # pretrain dataloader
+    if use_teacher_prefetch and cfg.data.format == "dali":
+        raise ValueError(
+            "teacher_prefetch is only implemented for the standard PyTorch dataloader path; "
+            "set data.format=image_folder or h5 instead of dali."
+        )
+
     if cfg.data.format == "dali":
         assert (
             _dali_avaliable
@@ -169,7 +182,14 @@ def main(cfg: DictConfig):
             no_labels=cfg.data.no_labels,
             data_fraction=cfg.data.fraction,
             preload=cfg.data.preload,
+            deterministic_augmentations=use_teacher_prefetch,
+            deterministic_augmentations_seed=teacher_prefetch_seed,
         )
+        if use_teacher_prefetch and hasattr(train_dataset, "get_epoch_ref") and hasattr(
+            model, "attach_teacher_prefetch_epoch_ref"
+        ):
+            model.attach_teacher_prefetch_epoch_ref(train_dataset.get_epoch_ref())
+
         train_loader = prepare_dataloader(
             train_dataset, batch_size=cfg.optimizer.batch_size, num_workers=cfg.data.num_workers
         )

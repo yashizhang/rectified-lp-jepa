@@ -41,7 +41,7 @@ umap = [
 
 [tool.setuptools]
 include-package-data = true
-py-modules = ["main_pretrain"]
+py-modules = ["main_pretrain", "main_prefetch_teacher"]
 
 [tool.setuptools.packages.find]
 include = ["solo*"]

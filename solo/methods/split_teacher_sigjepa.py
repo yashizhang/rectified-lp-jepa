@@ -28,6 +28,11 @@ from solo.losses.split_teacher_sigjepa import split_teacher_sigjepa_loss
 from solo.methods.base import BaseMethod
 from solo.utils.misc import omegaconf_select
 from solo.utils.teacher import build_teacher
+from solo.utils.teacher_prefetch import (
+    TeacherPrefetchReader,
+    build_teacher_prefetch_fingerprint,
+    resolve_teacher_prefetch_epoch,
+)
 
 
 def _off_diagonal_covariance_energy(z: torch.Tensor) -> torch.Tensor:
@@ -95,10 +100,39 @@ class SplitTeacherSIGJEPA(BaseMethod):
             nn.Linear(proj_hidden_dim, self.proj_output_dim),
         )
 
-        self.teacher = build_teacher(cfg)
-        self.teacher.requires_grad_(False)
-        self.teacher.eval()
-        self.teacher_dim: int = int(getattr(self.teacher, "output_dim", cfg.method_kwargs.teacher_output_dim))
+        self.teacher_prefetch_enabled: bool = bool(
+            omegaconf_select(cfg, "method_kwargs.teacher_prefetch.enabled", False)
+        )
+        self.teacher_prefetch_epoch_mode: str = str(
+            omegaconf_select(cfg, "method_kwargs.teacher_prefetch.epoch_mode", "wrap")
+        )
+        self.teacher_prefetch_cache = None
+        self._teacher_prefetch_epoch_ref = None
+
+        teacher_branch_requested = self.lambda_teacher > 0 and self.compatible_dim > 0
+        configured_teacher_dim = int(cfg.method_kwargs.teacher_output_dim)
+        if teacher_branch_requested and self.teacher_prefetch_enabled:
+            cache_dir = omegaconf_select(cfg, "method_kwargs.teacher_prefetch.cache_dir", None)
+            if cache_dir is None:
+                raise ValueError(
+                    "teacher_prefetch.enabled=True requires method_kwargs.teacher_prefetch.cache_dir."
+                )
+            self.teacher = None
+            self.teacher_prefetch_cache = TeacherPrefetchReader(
+                cache_dir,
+                expected_fingerprint=build_teacher_prefetch_fingerprint(cfg),
+                expected_num_views=self.num_large_crops,
+                expected_teacher_dim=configured_teacher_dim,
+            )
+            self.teacher_dim = int(self.teacher_prefetch_cache.teacher_dim)
+        elif teacher_branch_requested:
+            self.teacher = build_teacher(cfg)
+            self.teacher.requires_grad_(False)
+            self.teacher.eval()
+            self.teacher_dim = int(getattr(self.teacher, "output_dim", configured_teacher_dim))
+        else:
+            self.teacher = None
+            self.teacher_dim = configured_teacher_dim
 
         self.align_head = (
             nn.Linear(self.compatible_dim, self.teacher_dim, bias=False)
@@ -106,14 +140,23 @@ class SplitTeacherSIGJEPA(BaseMethod):
             else None
         )
 
-        print(
-            "SplitTeacherSIGJEPA teacher configured:",
-            f"backend={cfg.method_kwargs.teacher_backend},",
-            f"model_id={cfg.method_kwargs.teacher_model_id},",
-            f"teacher_dim={self.teacher_dim},",
-            f"pooling={cfg.method_kwargs.teacher_pooling},",
-            f"chunk_size={cfg.method_kwargs.teacher_chunk_size}",
-        )
+        if self.teacher_prefetch_cache is not None:
+            print(
+                "SplitTeacherSIGJEPA teacher prefetch configured:",
+                f"cache_dir={omegaconf_select(cfg, 'method_kwargs.teacher_prefetch.cache_dir', None)},",
+                f"cache_epochs={self.teacher_prefetch_cache.num_epochs},",
+                f"epoch_mode={self.teacher_prefetch_epoch_mode},",
+                f"teacher_dim={self.teacher_dim}",
+            )
+        elif teacher_branch_requested and self.teacher is not None:
+            print(
+                "SplitTeacherSIGJEPA teacher configured:",
+                f"backend={cfg.method_kwargs.teacher_backend},",
+                f"model_id={cfg.method_kwargs.teacher_model_id},",
+                f"teacher_dim={self.teacher_dim},",
+                f"pooling={cfg.method_kwargs.teacher_pooling},",
+                f"chunk_size={cfg.method_kwargs.teacher_chunk_size}",
+            )
 
     @staticmethod
     def add_and_assert_specific_cfg(cfg: omegaconf.DictConfig) -> omegaconf.DictConfig:
@@ -169,6 +212,48 @@ class SplitTeacherSIGJEPA(BaseMethod):
         cfg.method_kwargs.teacher_eager_load = omegaconf_select(
             cfg, "method_kwargs.teacher_eager_load", False
         )
+
+        cfg.method_kwargs.teacher_prefetch = omegaconf_select(
+            cfg, "method_kwargs.teacher_prefetch", {}
+        )
+        cfg.method_kwargs.teacher_prefetch.enabled = omegaconf_select(
+            cfg, "method_kwargs.teacher_prefetch.enabled", False
+        )
+        cfg.method_kwargs.teacher_prefetch.cache_dir = omegaconf_select(
+            cfg,
+            "method_kwargs.teacher_prefetch.cache_dir",
+            f"teacher_prefetch_cache/{omegaconf_select(cfg, 'name', 'split_teacher_sigjepa')}",
+        )
+        cfg.method_kwargs.teacher_prefetch.num_epochs = int(
+            omegaconf_select(cfg, "method_kwargs.teacher_prefetch.num_epochs", cfg.max_epochs)
+        )
+        cfg.method_kwargs.teacher_prefetch.epoch_mode = omegaconf_select(
+            cfg, "method_kwargs.teacher_prefetch.epoch_mode", "wrap"
+        )
+        cfg.method_kwargs.teacher_prefetch.dtype = omegaconf_select(
+            cfg, "method_kwargs.teacher_prefetch.dtype", "float16"
+        )
+        cfg.method_kwargs.teacher_prefetch.base_seed = int(
+            omegaconf_select(cfg, "method_kwargs.teacher_prefetch.base_seed", cfg.seed)
+        )
+        cfg.method_kwargs.teacher_prefetch.batch_size = int(
+            omegaconf_select(
+                cfg,
+                "method_kwargs.teacher_prefetch.batch_size",
+                cfg.optimizer.batch_size,
+            )
+        )
+        cfg.method_kwargs.teacher_prefetch.num_workers = int(
+            omegaconf_select(
+                cfg,
+                "method_kwargs.teacher_prefetch.num_workers",
+                cfg.data.num_workers,
+            )
+        )
+        cfg.method_kwargs.teacher_prefetch.overwrite = bool(
+            omegaconf_select(cfg, "method_kwargs.teacher_prefetch.overwrite", False)
+        )
+
         cfg.method_kwargs.projector_type = omegaconf_select(
             cfg, "method_kwargs.projector_type", "mlp"
         )
@@ -192,6 +277,56 @@ class SplitTeacherSIGJEPA(BaseMethod):
     @property
     def use_free_branch(self) -> bool:
         return self.lambda_sigreg > 0 and self.free_dim > 0
+
+    def attach_teacher_prefetch_epoch_ref(self, epoch_ref) -> None:
+        self._teacher_prefetch_epoch_ref = epoch_ref
+
+    def _resolve_teacher_prefetch_epoch(self, train_epoch: int) -> int:
+        if self.teacher_prefetch_cache is None:
+            return int(train_epoch)
+        return resolve_teacher_prefetch_epoch(
+            train_epoch=int(train_epoch),
+            num_prefetch_epochs=int(self.teacher_prefetch_cache.num_epochs),
+            epoch_mode=self.teacher_prefetch_epoch_mode,
+        )
+
+    def on_train_epoch_start(self) -> None:
+        if self.teacher_prefetch_cache is None:
+            return
+
+        if self._teacher_prefetch_epoch_ref is None:
+            raise RuntimeError(
+                "teacher_prefetch is enabled, but no deterministic dataset epoch reference was "
+                "attached to SplitTeacherSIGJEPA. main_pretrain.py should attach the epoch "
+                "reference returned by the training dataset."
+            )
+
+        cache_epoch = self._resolve_teacher_prefetch_epoch(int(self.current_epoch))
+        with self._teacher_prefetch_epoch_ref.get_lock():
+            self._teacher_prefetch_epoch_ref.value = cache_epoch
+        self.teacher_prefetch_cache.set_epoch(cache_epoch)
+
+    def _get_prefetched_teacher_targets(
+        self,
+        img_indexes: torch.Tensor,
+        device: torch.device,
+    ) -> Sequence[torch.Tensor]:
+        if self.teacher_prefetch_cache is None:
+            raise RuntimeError("Teacher prefetch cache is not initialized.")
+
+        cache_epoch = self._resolve_teacher_prefetch_epoch(int(self.current_epoch))
+        self.teacher_prefetch_cache.set_epoch(cache_epoch)
+        cached = self.teacher_prefetch_cache.fetch(
+            img_indexes,
+            device=device,
+            dtype=torch.float32,
+        )
+        if cached.ndim != 3 or cached.size(1) < 2:
+            raise ValueError(
+                "Teacher prefetch cache must return a tensor with shape [B, num_views, teacher_dim] "
+                f"and at least 2 views, got {tuple(cached.shape)}."
+            )
+        return F.normalize(cached[:, 0], dim=1), F.normalize(cached[:, 1], dim=1)
 
     def forward(self, X: torch.Tensor) -> Dict[str, Any]:
         out = super().forward(X)
@@ -217,7 +352,7 @@ class SplitTeacherSIGJEPA(BaseMethod):
         z_c1, z_c2 = out["z_c"]
         z_f1, z_f2 = out["z_f"]
 
-        _, X, _targets = batch
+        img_indexes, X, _targets = batch
         X = [X] if isinstance(X, torch.Tensor) else X
         x1, x2 = X[:2]
 
@@ -226,8 +361,16 @@ class SplitTeacherSIGJEPA(BaseMethod):
             a1 = F.normalize(self.align_head(z_c1), dim=1)
             a2 = F.normalize(self.align_head(z_c2), dim=1)
             with torch.no_grad():
-                t1 = F.normalize(self.teacher(x1), dim=1)
-                t2 = F.normalize(self.teacher(x2), dim=1)
+                if self.teacher_prefetch_cache is not None:
+                    t1, t2 = self._get_prefetched_teacher_targets(img_indexes, device=x1.device)
+                else:
+                    if self.teacher is None:
+                        raise RuntimeError(
+                            "Teacher branch is enabled, but neither an online teacher nor a "
+                            "teacher_prefetch cache is available."
+                        )
+                    t1 = F.normalize(self.teacher(x1), dim=1)
+                    t2 = F.normalize(self.teacher(x2), dim=1)
         else:
             a1 = a2 = t1 = t2 = None
 
