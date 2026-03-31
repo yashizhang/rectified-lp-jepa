@@ -10,10 +10,12 @@ hydra:
   run:
     dir: .
 
-name: "split-teacher-sigjepa-imagenet100"
+name: "split-teacher-sigjepa-dinov2-imagenet100"
 method: "split_teacher_sigjepa"
 backbone:
-  name: "resnet50"
+  name: "vit_base"
+  kwargs:
+    patch_size: 14
 
 method_kwargs:
   proj_hidden_dim: 2048
@@ -31,18 +33,18 @@ method_kwargs:
   sigreg_t_max: 5.0
   sigreg_use_real: false
 
-  teacher_backend: "hf_ijepa"
-  teacher_model_id: "facebook/ijepa_vith14_1k"
+  teacher_backend: "hf_dinov2"
+  teacher_model_id: "facebook/dinov2-large"
   teacher_local_dir: null
-  teacher_pooling: "mean"
-  teacher_output_dim: 1280
+  teacher_pooling: "cls"
+  teacher_output_dim: 1024
   teacher_chunk_size: 16
   teacher_use_same_views: true
   teacher_eager_load: false
 
   teacher_prefetch:
     enabled: false
-    cache_dir: "teacher_prefetch_cache/${name}"
+    cache_dir: "teacher_prefetch_cache/${name}"  # can also be an absolute path on shared/local storage
     num_epochs: ${max_epochs}
     epoch_mode: "wrap"
     dtype: "float16"

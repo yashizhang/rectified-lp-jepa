@@ -157,52 +157,63 @@ This keeps the implementation close to the current repo and reduces code changes
 
 ## 4.4 Teacher branch
 
-### Default JEPA teacher for ImageNet-100 v0
+### Default DinoV2 teacher for ImageNet-100 v0
 
-Use a frozen **I-JEPA ViT-H/14 ImageNet-1K checkpoint** as the default teacher:
+Use a frozen **DinoV2 ViT-B/14 checkpoint** as the default teacher on `z_c`:
 
-- Hugging Face model id: `facebook/ijepa_vith14_1k`
-- family: `I-JEPA`
-- architecture: `ViT-H/14`
-- pretraining data: `ImageNet-1K`
-- intended use: **feature extraction**
-- teacher output dim: `1280`
-- default pooling: mean over `last_hidden_state`
+- Hugging Face model id: `facebook/dinov2-base`
+- family: `DinoV2`
+- architecture: `ViT-B/14`
+- pretraining data: `LVD-142M`
+- intended use: **feature extraction / retrieval-style image embeddings**
+- teacher output dim: `768`
+- default pooling: `CLS` token
 
-This should be the default teacher for all teacher-based baselines in v0.
+This should be the default teacher for all main teacher-based baselines in v0.
 
 Why this teacher:
 
-- it is a real JEPA teacher,
-- it has a public, easy-to-load checkpoint,
-- it is already trained on the same broad natural-image domain,
-- it gives a single strong semantic feature vector per image with minimal extra code,
-- it avoids training a separate teacher from scratch on ImageNet-100.
+- it is an off-the-shelf, high-quality frozen vision teacher,
+- it is easy to load through `transformers.AutoModel`,
+- it provides a single semantic image embedding with minimal extra code,
+- it keeps the teacher branch simple while leaving `z_f` fully on the LeJEPA + SIGReg path,
+- it makes offline precomputation and cache reuse straightforward.
 
-Do **not** start with a custom teacher trained inside this repo. Use the off-the-shelf ImageNet-1K I-JEPA teacher first.
+Do **not** start with a custom teacher trained inside this repo. Use the off-the-shelf DinoV2 teacher first.
+
+### Optional DinoV2-with-registers variant
+
+Retain an optional backend for:
+
+- `teacher_backend = "hf_dinov2_with_registers"`
+- `teacher_model_id = "facebook/dinov2-with-registers-base"`
+- `teacher_output_dim = 768`
+- `teacher_pooling = "cls"`
+
+This should be an optional comparison only. The main v0 default remains `facebook/dinov2-base`.
 
 ### Teacher forward contract
 
 Use a frozen teacher wrapper that returns one vector per image:
 
 ```python
-t = teacher(x)  # shape [B, 1280]
+t = teacher(x)  # shape [B, 768]
 ```
 
 Requirements:
 
 - `teacher.eval()` always,
 - `torch.no_grad()` always,
-- teacher parameters excluded from optimizer,
-- default `teacher_dim = 1280`,
-- output dim can still be inferred at runtime from the teacher config,
+- teacher parameters excluded from the optimizer,
+- default `teacher_dim = 768`,
+- output dim can still be inferred from common model ids or verified at runtime from the teacher config,
 - do not create a separate teacher projector in v0.
 
 ### Important normalization rule
 
-Do **not** call `AutoProcessor` inside the training loop.
+Do **not** call `AutoImageProcessor` inside the training loop.
 
-The current ImageNet-100 repo pipeline already produces `224x224` tensors normalized with standard ImageNet mean/std. The I-JEPA teacher uses the same ImageNet normalization convention, so the same augmented crop tensor should be sent directly to the teacher.
+The current ImageNet-100 repo pipeline already produces `224x224` tensors normalized with standard ImageNet mean/std. DinoV2 uses the same normalization convention, so the same augmented crop tensor should be sent directly to the teacher.
 
 That means:
 
@@ -211,21 +222,37 @@ That means:
 - no extra PIL/CPU preprocessing is introduced,
 - no second augmentation pipeline is needed.
 
-If you ever want to use `AutoProcessor`, only use it for one-off offline debugging, not for online training.
+If you ever want to use `AutoImageProcessor`, only use it for one-off offline debugging, not for online training.
+
+### Patch-size note
+
+DinoV2 is patch-based internally, but that does **not** require the student JEPA to become patch-based.
+
+For this v0 design, distillation stays image-level:
+
+- the teacher consumes the same `224x224` crop tensor as the student,
+- the teacher produces one pooled vector per crop,
+- the alignment loss is still applied only on `z_c`,
+- `z_f` still uses the LeJEPA-style SIGReg loss unchanged.
+
+Current large crops are `224x224`, which is already divisible by DinoV2's `14x14` patch size, so the default setup is clean. If you later distill local views or use crop sizes that are not multiples of `14`, revisit view sizing and correspondence before adding those experiments.
 
 ## 4.5 Teacher implementation details
 
-Implement the teacher as a dedicated wrapper around `transformers.AutoModel`.
+Implement the teacher as a small wrapper around `transformers.AutoModel`.
 
 Suggested class name:
 
 ```python
-FrozenIJepaTeacher
+FrozenHFAutoTeacher
 ```
 
 Suggested behavior:
 
-- load `AutoModel.from_pretrained("facebook/ijepa_vith14_1k")`,
+- support `hf_dinov2` as the default backend,
+- support `hf_dinov2_with_registers` as an optional backend,
+- keep `hf_ijepa` only as an optional comparison backend,
+- load `AutoModel.from_pretrained(...)`,
 - freeze all parameters,
 - keep the model in eval mode forever,
 - infer `output_dim = model.config.hidden_size`,
@@ -241,11 +268,11 @@ import torch.nn as nn
 from transformers import AutoModel
 
 
-class FrozenIJepaTeacher(nn.Module):
+class FrozenHFAutoTeacher(nn.Module):
     def __init__(
         self,
-        model_id: str = "facebook/ijepa_vith14_1k",
-        pooling: str = "mean",
+        model_id: str = "facebook/dinov2-base",
+        pooling: str = "cls",
         chunk_size: int = 16,
         cast_output_to_float32: bool = True,
     ):
@@ -259,6 +286,7 @@ class FrozenIJepaTeacher(nn.Module):
         self.chunk_size = chunk_size
         self.cast_output_to_float32 = cast_output_to_float32
         self.output_dim = int(self.model.config.hidden_size)
+        self.num_register_tokens = int(getattr(self.model.config, "num_register_tokens", 0) or 0)
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -267,12 +295,12 @@ class FrozenIJepaTeacher(nn.Module):
             outputs = self.model(pixel_values=x_chunk, return_dict=True)
             h = outputs.last_hidden_state
 
-            if self.pooling == "mean":
-                f = h.mean(dim=1)
-            elif self.pooling == "cls":
+            if self.pooling == "cls":
                 f = h[:, 0]
             elif self.pooling == "patch_mean":
-                f = h[:, 1:].mean(dim=1)
+                f = h[:, 1 + self.num_register_tokens :].mean(dim=1)
+            elif self.pooling == "mean":
+                f = h.mean(dim=1)
             else:
                 raise ValueError(f"Unknown pooling: {self.pooling}")
 
@@ -288,23 +316,24 @@ class FrozenIJepaTeacher(nn.Module):
 Default to:
 
 ```python
-teacher_feature = outputs.last_hidden_state.mean(dim=1)
+teacher_feature = outputs.last_hidden_state[:, 0]
 ```
 
-This is the simplest choice and matches the public I-JEPA Hugging Face feature-extraction example.
+This keeps DinoV2 distillation simple and avoids accidentally averaging in register tokens for the register-based models.
 
 Do **not** start with:
 
 - last-4-layer averaging,
 - token-level teacher supervision,
 - separate teacher projector heads,
-- CLS/patch fusion.
+- CLS/patch fusion,
+- mean pooling over all tokens for the register-based teacher.
 
 Those are later ablations, not part of v0.
 
 ### Memory / speed rule
 
-Because `facebook/ijepa_vith14_1k` is large, teacher forward should support chunking.
+Teacher forward should support chunking.
 
 Default:
 
@@ -315,7 +344,8 @@ teacher_chunk_size = 16
 If there is OOM:
 
 1. lower `teacher_chunk_size` first,
-2. only lower the main batch size if chunking is still insufficient.
+2. enable teacher prefetch and cache the DinoV2 embeddings on local/shared storage,
+3. only lower the main batch size if chunking and prefetch are still insufficient.
 
 ## 4.6 Alignment head
 
@@ -618,7 +648,7 @@ solo/methods/split_teacher_sigjepa.py
 scripts/pretrain/imagenet-100/split_teacher_sigjepa_imagenet100.yaml
 ```
 
-Add a recent `transformers` dependency with I-JEPA support.
+Add a recent `transformers` dependency with DinoV2 / I-JEPA support.
 
 ## 9.2 File responsibilities
 
@@ -645,16 +675,16 @@ Make sure these are plain functions, not methods.
 
 ### `solo/utils/teacher.py`
 
-Contains the concrete I-JEPA teacher implementation for v0:
+Contains the concrete frozen teacher implementation for v0:
 
-- `FrozenIJepaTeacher`,
+- `FrozenHFAutoTeacher`,
 - `build_teacher(cfg)` factory,
-- one code path only: Hugging Face I-JEPA first,
+- default path: Hugging Face DinoV2 first,
 - expose `forward(x) -> [B, teacher_dim]`,
 - stay in `eval()` and `no_grad()`,
 - support chunked forward with `teacher_chunk_size`.
 
-Do **not** build a generic teacher zoo in the first pass. Keep the code path focused on `facebook/ijepa_vith14_1k`.
+Keep the backend surface small in the first pass: `hf_dinov2` by default, `hf_dinov2_with_registers` optional, and `hf_ijepa` only for explicit comparison runs.
 
 ### `solo/methods/split_teacher_sigjepa.py`
 
@@ -680,9 +710,9 @@ self.teacher_dim = self.teacher.output_dim
 Recommended config contract:
 
 ```python
-teacher_backend == "hf_ijepa"
-teacher_model_id == "facebook/ijepa_vith14_1k"
-teacher_pooling == "mean"
+teacher_backend == "hf_dinov2"
+teacher_model_id == "facebook/dinov2-base"
+teacher_pooling == "cls"
 teacher_chunk_size == 16
 ```
 
@@ -825,7 +855,7 @@ def training_step(self, batch, batch_idx):
 ## 13. Config skeleton
 
 ```yaml
-name: "split-teacher-sigjepa-imagenet100"
+name: "split-teacher-sigjepa-dinov2-imagenet100"
 method: "split_teacher_sigjepa"
 
 backbone:
@@ -847,11 +877,11 @@ method_kwargs:
   sigreg_t_max: 5.0
   sigreg_use_real: false
 
-  teacher_backend: "hf_ijepa"
-  teacher_model_id: "facebook/ijepa_vith14_1k"
+  teacher_backend: "hf_dinov2"
+  teacher_model_id: "facebook/dinov2-base"
   teacher_local_dir: null
-  teacher_pooling: "mean"
-  teacher_output_dim: 1280
+  teacher_pooling: "cls"
+  teacher_output_dim: 768
   teacher_chunk_size: 16
   teacher_use_same_views: true
 
@@ -921,8 +951,8 @@ precision: 16-mixed
 
 Teacher-specific config notes:
 
-- keep `teacher_model_id = "facebook/ijepa_vith14_1k"` fixed for all teacher-based baselines,
-- keep `teacher_pooling = "mean"` fixed in v0,
+- keep `teacher_model_id = "facebook/dinov2-base"` fixed for all main teacher-based baselines,
+- keep `teacher_pooling = "cls"` fixed in v0,
 - pass the same normalized crops used by the student directly to the teacher,
 - do not add a second teacher transform pipeline.
 
@@ -1040,15 +1070,15 @@ This is the main method.
 
 ## 14.4 Optional teacher-source comparison
 
-Only after the default I-JEPA teacher works, rerun B2/B3/B6 with:
+Only after the default DinoV2 teacher works, rerun B2/B3/B6 with:
 
-- default JEPA teacher: `facebook/ijepa_vith14_1k`,
-- alternative JEPA teacher if one is available locally,
-- non-JEPA teacher only as an optional out-of-family comparison.
+- default DinoV2 teacher: `facebook/dinov2-base`,
+- optional DinoV2-with-registers teacher: `facebook/dinov2-with-registers-base`,
+- legacy I-JEPA teacher only as an explicit out-of-family comparison.
 
 Keep the student, budget, and hyperparameters unchanged.
 
-For v0, all main comparisons should use the same default I-JEPA teacher.
+For v0, all main comparisons should use the same default DinoV2 teacher.
 
 ---
 
@@ -1196,7 +1226,7 @@ Goal: verify shapes, DDP, AMP, teacher loading, teacher normalization adaptation
 
 Extra smoke-test requirement:
 
-- print and verify `teacher_dim == 1280` for `facebook/ijepa_vith14_1k`,
+- print and verify `teacher_dim == 768` for `facebook/dinov2-base`,
 - verify teacher forward works on the already-normalized student crops,
 - verify chunked teacher forward returns the same shape as non-chunked forward.
 
@@ -1225,7 +1255,7 @@ Run `1000` epochs for:
 
 The **only** thing v0 should test is:
 
-> Can a student latent be split into a teacher-compatible subspace `z_c` and a free subspace `z_f`, with a frozen official I-JEPA teacher on `z_c`, SIGReg on `z_f`, and JEPA predictive loss on the full concatenated latent?
+> Can a student latent be split into a teacher-compatible subspace `z_c` and a free subspace `z_f`, with a frozen official DinoV2 teacher on `z_c`, SIGReg on `z_f`, and JEPA predictive loss on the full concatenated latent?
 
 If this minimal version works, then later versions can add:
 

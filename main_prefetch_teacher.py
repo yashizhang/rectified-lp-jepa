@@ -57,7 +57,7 @@ def main(cfg: DictConfig):
             "set data.format=image_folder or h5 instead of dali."
         )
 
-    teacher_backend = omegaconf_select(cfg, "method_kwargs.teacher_backend", "hf_ijepa")
+    teacher_backend = omegaconf_select(cfg, "method_kwargs.teacher_backend", "hf_dinov2")
     if teacher_backend in {None, "none"}:
         raise ValueError(
             "A real frozen teacher is required to precompute teacher representations; "
@@ -132,6 +132,8 @@ def main(cfg: DictConfig):
     )
     print(
         "Teacher prefetch target:",
+        f"backend={teacher_backend}",
+        f"model_id={omegaconf_select(cfg, 'method_kwargs.teacher_model_id', None)}",
         f"cache_dir={prefetch_cache_dir}",
         f"num_epochs={num_prefetch_epochs}",
         f"num_samples={len(train_dataset)}",

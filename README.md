@@ -110,6 +110,48 @@ python3 main_pretrain.py \
 ``` -->
 
 
+
+## Split Teacher + SIGReg JEPA with DinoV2 on `z_c`
+
+The repository also includes a **split teacher + SIGReg JEPA** path in which:
+
+- `z_c` is distilled against a frozen **DinoV2** teacher,
+- `z_f` follows the **LeJEPA/SIGReg** recipe, and
+- the predictive loss is applied on the full latent `torch.cat([z_c, z_f], dim=1)`.
+
+The default ImageNet-100 config is:
+
+- `scripts/pretrain/imagenet-100/split_teacher_sigjepa_imagenet100.yaml`
+- student backbone: `vit_base` with `patch_size=14`
+- teacher backend: `hf_dinov2`
+- teacher model id: `facebook/dinov2-large`
+- teacher pooling: `cls`
+
+### Online DinoV2 teacher
+
+```bash
+python3 main_pretrain.py \
+  --config-path scripts/pretrain/imagenet-100/ \
+  --config-name=split_teacher_sigjepa_imagenet100.yaml \
+  ++wandb.entity=<ENTITY> \
+  ++wandb.project=<PROJECT> \
+  ++wandb.enabled=true
+```
+
+### Prefetch DinoV2 embeddings to storage
+
+```bash
+python3 main_prefetch_teacher.py \
+  --config-path scripts/pretrain/imagenet-100/ \
+  --config-name=split_teacher_sigjepa_imagenet100.yaml \
+  name=dinov2_sigjepa_prefetch_1ep \
+  ++method_kwargs.teacher_prefetch.cache_dir=/path/to/storage/teacher_prefetch_cache/dinov2_sigjepa_prefetch_1ep \
+  ++method_kwargs.teacher_prefetch.num_epochs=1 \
+  ++method_kwargs.teacher_prefetch.dtype=float16
+```
+
+Then point training at the same cache directory with `++method_kwargs.teacher_prefetch.enabled=true`. See [`commands.md`](commands.md) for complete examples.
+
 ## Acknowledgements
 
 This codebase is built upon the [solo-learn](https://github.com/vturrisi/solo-learn) framework.
@@ -128,4 +170,3 @@ Please cite our work if you find it helpful:
       url={https://arxiv.org/abs/2602.01456}, 
 }
 ```
-

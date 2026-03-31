@@ -125,7 +125,7 @@ for cache_epoch in {0, ..., num_prefetch_epochs - 1}:
 - teacher loss touches z_c only
 - SIGReg touches z_f only
 - teacher is either:
-    (a) online frozen I-JEPA, or
+    (a) online frozen DinoV2 (or another configured teacher backend), or
     (b) an on-disk prefetched cache generated from the exact same deterministic crops
 - cached teacher targets are indexed by (cache_epoch, sample_index, view_index)
 ```

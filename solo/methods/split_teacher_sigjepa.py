@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from solo.losses.split_teacher_sigjepa import split_teacher_sigjepa_loss
 from solo.methods.base import BaseMethod
 from solo.utils.misc import omegaconf_select
-from solo.utils.teacher import build_teacher
+from solo.utils.teacher import build_teacher, get_teacher_backend_defaults
 from solo.utils.teacher_prefetch import (
     TeacherPrefetchReader,
     build_teacher_prefetch_fingerprint,
@@ -189,20 +189,24 @@ class SplitTeacherSIGJEPA(BaseMethod):
         )
 
         cfg.method_kwargs.teacher_backend = omegaconf_select(
-            cfg, "method_kwargs.teacher_backend", "hf_ijepa"
+            cfg, "method_kwargs.teacher_backend", "hf_dinov2"
+        )
+        teacher_defaults = get_teacher_backend_defaults(
+            cfg.method_kwargs.teacher_backend,
+            omegaconf_select(cfg, "method_kwargs.teacher_model_id", None),
         )
         cfg.method_kwargs.teacher_model_id = omegaconf_select(
-            cfg, "method_kwargs.teacher_model_id", "facebook/ijepa_vith14_1k"
+            cfg, "method_kwargs.teacher_model_id", teacher_defaults["model_id"]
         )
         cfg.method_kwargs.teacher_local_dir = omegaconf_select(
             cfg, "method_kwargs.teacher_local_dir", None
         )
         cfg.method_kwargs.teacher_pooling = omegaconf_select(
-            cfg, "method_kwargs.teacher_pooling", "mean"
+            cfg, "method_kwargs.teacher_pooling", teacher_defaults["pooling"]
         )
-        cfg.method_kwargs.teacher_output_dim = omegaconf_select(
-            cfg, "method_kwargs.teacher_output_dim", 1280
-        )
+        cfg.method_kwargs.teacher_output_dim = int(omegaconf_select(
+            cfg, "method_kwargs.teacher_output_dim", teacher_defaults["output_dim"]
+        ))
         cfg.method_kwargs.teacher_chunk_size = omegaconf_select(
             cfg, "method_kwargs.teacher_chunk_size", 16
         )

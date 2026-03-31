@@ -91,7 +91,7 @@ def build_teacher_prefetch_metadata(
     base_seed = int(omegaconf_select(cfg, "method_kwargs.teacher_prefetch.base_seed", cfg.seed))
 
     return {
-        "version": 1,
+        "version": 2,
         "fingerprint": build_teacher_prefetch_fingerprint(cfg),
         "num_epochs": num_prefetch_epochs,
         "num_samples": int(num_samples),
