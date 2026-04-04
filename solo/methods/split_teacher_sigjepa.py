@@ -165,7 +165,7 @@ class SplitTeacherSIGJEPA(BaseMethod):
         assert not omegaconf.OmegaConf.is_missing(cfg, "method_kwargs.proj_output_dim")
         assert not omegaconf.OmegaConf.is_missing(cfg, "method_kwargs.proj_hidden_dim")
 
-        cfg.method_kwargs.compatible_dim = omegaconf_select(cfg, "method_kwargs.compatible_dim", 512)
+        cfg.method_kwargs.compatible_dim = omegaconf_select(cfg, "method_kwargs.compatible_dim", 1024)
         cfg.method_kwargs.free_dim = omegaconf_select(
             cfg,
             "method_kwargs.free_dim",

@@ -20,8 +20,8 @@ backbone:
 method_kwargs:
   proj_hidden_dim: 2048
   proj_output_dim: 2048
-  compatible_dim: 512
-  free_dim: 1536
+  compatible_dim: 1024
+  free_dim: 1024
 
   lambda_pred: 1.0
   lambda_teacher: 1.0
@@ -100,15 +100,11 @@ augmentations:
     num_crops: 2
 
 optimizer:
-  name: "lars"
+  name: "adamw"
   batch_size: 128
-  lr: 0.0825
-  classifier_lr: 0.0275
+  lr: 5e-4
+  classifier_lr: 5e-3
   weight_decay: 1e-4
-  kwargs:
-    clip_lr: true
-    eta: 0.02
-    exclude_bias_n_norm: true
 
 scheduler:
   name: "warmup_cosine"

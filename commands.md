@@ -81,16 +81,6 @@ torchrun --nproc_per_node=4 main_prefetch_teacher.py \
   --config-name split_teacher_sigjepa_imagenet100.yaml \
   name=dinov2_sigjepa_prefetch_1000ep \
   max_epochs=1000 \
-  ++method_kwargs.teacher_prefetch.cache_dir=./teacher_prefetch_cache/dinov2_sigjepa_prefetch_1000ep \
-  ++method_kwargs.teacher_prefetch.num_epochs=1000 \
-  ++method_kwargs.teacher_prefetch.dtype=float16 \
-  ++method_kwargs.teacher_prefetch.overwrite=false
-
-torchrun --nproc_per_node=4 main_prefetch_teacher.py \
-  --config-path scripts/pretrain/imagenet-100 \
-  --config-name split_teacher_sigjepa_imagenet100.yaml \
-  name=dinov2_sigjepa_prefetch_1000ep \
-  max_epochs=1000 \
   data.preload=false \
   ++method_kwargs.teacher_prefetch.num_workers=2 \
   ++method_kwargs.teacher_prefetch.cache_dir=/gpfs/projects/AI4D/core-132/yashi/teacher_prefetch_cache/dinov2_sigjepa_prefetch_1000ep \

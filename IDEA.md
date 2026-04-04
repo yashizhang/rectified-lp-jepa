@@ -31,10 +31,10 @@ Keep the released ImageNet-100 setup:
 - grayscale `0.2`
 - Gaussian blur `0.5`
 - solarization `0.1`
-- optimizer: `LARS`
+- optimizer: `AdamW`
 - batch size `128`
-- learning rate `0.0825`
-- classifier learning rate `0.0275`
+- learning rate `5e-4`
+- classifier learning rate `5e-3`
 - weight decay `1e-4`
 - scheduler: warmup + cosine
 - `max_epochs = 1000`
@@ -147,8 +147,8 @@ Important:
 
 Default split:
 
-- `compatible_dim = 512`
-- `free_dim = 1536`
+- `compatible_dim = 1024`
+- `free_dim = 1024`
 - require `compatible_dim + free_dim == proj_output_dim`
 
 Split by slicing only. Do **not** make two separate projector heads in v0.
@@ -864,8 +864,8 @@ backbone:
 method_kwargs:
   proj_hidden_dim: 2048
   proj_output_dim: 2048
-  compatible_dim: 512
-  free_dim: 1536
+  compatible_dim: 1024
+  free_dim: 1024
 
   lambda_pred: 1.0
   lambda_teacher: 1.0
@@ -928,15 +928,11 @@ augmentations:
     num_crops: 2
 
 optimizer:
-  name: "lars"
+  name: "adamw"
   batch_size: 128
-  lr: 0.0825
-  classifier_lr: 0.0275
+  lr: 5e-4
+  classifier_lr: 5e-3
   weight_decay: 1e-4
-  kwargs:
-    clip_lr: true
-    eta: 0.02
-    exclude_bias_n_norm: true
 
 scheduler:
   name: "warmup_cosine"
@@ -1091,7 +1087,7 @@ Keep the grid small.
 ```text
 compatible_dim/free_dim:
 256 / 1792
-512 / 1536   <-- default
+1024 / 1024  <-- default
 1024 / 1024
 ```
 
@@ -1215,8 +1211,8 @@ Also assert teacher dim once inferred.
 
 Run for `10` to `20` epochs on ImageNet-100 with:
 
-- `compatible_dim = 512`
-- `free_dim = 1536`
+- `compatible_dim = 1024`
+- `free_dim = 1024`
 - `lambda_pred = 1.0`
 - `lambda_teacher = 1.0`
 - `lambda_sigreg = 0.05`
