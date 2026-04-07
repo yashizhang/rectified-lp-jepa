@@ -18,10 +18,11 @@ This version is intentionally minimal and should be preferred over more ambitiou
 
 ### Use the same ImageNet-100 training setting as the repo/paper
 
-Keep the released ImageNet-100 setup:
+Keep the current split-teacher ImageNet-100 setup in this repo:
 
 - dataset: `imagenet100`
-- backbone: `resnet50`
+- backbone: `vit_base`
+- patch size: `14`
 - projector: 3-layer MLP, hidden dim `2048`, output dim `2048`
 - two augmented crops
 - crop size `224`
@@ -118,9 +119,10 @@ This is the minimal implementation the user asked for.
 
 Keep the current repo choice for the main run:
 
-- `backbone = resnet50`
+- `backbone = vit_base`
+- `patch_size = 14`
 
-No change to the encoder path.
+Keep the encoder path as a ViT-B/14 student.
 
 ## 4.2 Student projector
 
@@ -159,14 +161,14 @@ This keeps the implementation close to the current repo and reduces code changes
 
 ### Default DinoV2 teacher for ImageNet-100 v0
 
-Use a frozen **DinoV2 ViT-B/14 checkpoint** as the default teacher on `z_c`:
+Use a frozen **DinoV2 ViT-L/14 checkpoint** as the default teacher on `z_c`:
 
-- Hugging Face model id: `facebook/dinov2-base`
+- Hugging Face model id: `facebook/dinov2-large`
 - family: `DinoV2`
-- architecture: `ViT-B/14`
+- architecture: `ViT-L/14`
 - pretraining data: `LVD-142M`
 - intended use: **feature extraction / retrieval-style image embeddings**
-- teacher output dim: `768`
+- teacher output dim: `1024`
 - default pooling: `CLS` token
 
 This should be the default teacher for all main teacher-based baselines in v0.
@@ -186,18 +188,18 @@ Do **not** start with a custom teacher trained inside this repo. Use the off-the
 Retain an optional backend for:
 
 - `teacher_backend = "hf_dinov2_with_registers"`
-- `teacher_model_id = "facebook/dinov2-with-registers-base"`
-- `teacher_output_dim = 768`
+- `teacher_model_id = "facebook/dinov2-with-registers-large"`
+- `teacher_output_dim = 1024`
 - `teacher_pooling = "cls"`
 
-This should be an optional comparison only. The main v0 default remains `facebook/dinov2-base`.
+This should be an optional comparison only. The main v0 default remains `facebook/dinov2-large`.
 
 ### Teacher forward contract
 
 Use a frozen teacher wrapper that returns one vector per image:
 
 ```python
-t = teacher(x)  # shape [B, 768]
+t = teacher(x)  # shape [B, 1024]
 ```
 
 Requirements:
@@ -205,7 +207,7 @@ Requirements:
 - `teacher.eval()` always,
 - `torch.no_grad()` always,
 - teacher parameters excluded from the optimizer,
-- default `teacher_dim = 768`,
+- default `teacher_dim = 1024`,
 - output dim can still be inferred from common model ids or verified at runtime from the teacher config,
 - do not create a separate teacher projector in v0.
 
@@ -226,7 +228,7 @@ If you ever want to use `AutoImageProcessor`, only use it for one-off offline de
 
 ### Patch-size note
 
-DinoV2 is patch-based internally, but that does **not** require the student JEPA to become patch-based.
+In the default v0 setup, both student and teacher are `14x14` patch-based ViTs, but distillation still stays image-level.
 
 For this v0 design, distillation stays image-level:
 
@@ -271,7 +273,7 @@ from transformers import AutoModel
 class FrozenHFAutoTeacher(nn.Module):
     def __init__(
         self,
-        model_id: str = "facebook/dinov2-base",
+        model_id: str = "facebook/dinov2-large",
         pooling: str = "cls",
         chunk_size: int = 16,
         cast_output_to_float32: bool = True,
@@ -711,7 +713,7 @@ Recommended config contract:
 
 ```python
 teacher_backend == "hf_dinov2"
-teacher_model_id == "facebook/dinov2-base"
+teacher_model_id == "facebook/dinov2-large"
 teacher_pooling == "cls"
 teacher_chunk_size == 16
 ```
@@ -859,7 +861,9 @@ name: "split-teacher-sigjepa-dinov2-imagenet100"
 method: "split_teacher_sigjepa"
 
 backbone:
-  name: "resnet50"
+  name: "vit_base"
+  kwargs:
+    patch_size: 14
 
 method_kwargs:
   proj_hidden_dim: 2048
@@ -878,10 +882,10 @@ method_kwargs:
   sigreg_use_real: false
 
   teacher_backend: "hf_dinov2"
-  teacher_model_id: "facebook/dinov2-base"
+  teacher_model_id: "facebook/dinov2-large"
   teacher_local_dir: null
   teacher_pooling: "cls"
-  teacher_output_dim: 768
+  teacher_output_dim: 1024
   teacher_chunk_size: 16
   teacher_use_same_views: true
 
@@ -947,7 +951,7 @@ precision: 16-mixed
 
 Teacher-specific config notes:
 
-- keep `teacher_model_id = "facebook/dinov2-base"` fixed for all main teacher-based baselines,
+- keep `teacher_model_id = "facebook/dinov2-large"` fixed for all main teacher-based baselines,
 - keep `teacher_pooling = "cls"` fixed in v0,
 - pass the same normalized crops used by the student directly to the teacher,
 - do not add a second teacher transform pipeline.
@@ -1068,8 +1072,8 @@ This is the main method.
 
 Only after the default DinoV2 teacher works, rerun B2/B3/B6 with:
 
-- default DinoV2 teacher: `facebook/dinov2-base`,
-- optional DinoV2-with-registers teacher: `facebook/dinov2-with-registers-base`,
+- default DinoV2 teacher: `facebook/dinov2-large`,
+- optional DinoV2-with-registers teacher: `facebook/dinov2-with-registers-large`,
 - legacy I-JEPA teacher only as an explicit out-of-family comparison.
 
 Keep the student, budget, and hyperparameters unchanged.
@@ -1088,7 +1092,7 @@ Keep the grid small.
 compatible_dim/free_dim:
 256 / 1792
 1024 / 1024  <-- default
-1024 / 1024
+1792 / 256
 ```
 
 ## 15.2 Teacher weight
@@ -1222,7 +1226,7 @@ Goal: verify shapes, DDP, AMP, teacher loading, teacher normalization adaptation
 
 Extra smoke-test requirement:
 
-- print and verify `teacher_dim == 768` for `facebook/dinov2-base`,
+- print and verify `teacher_dim == 1024` for `facebook/dinov2-large`,
 - verify teacher forward works on the already-normalized student crops,
 - verify chunked teacher forward returns the same shape as non-chunked forward.
 
