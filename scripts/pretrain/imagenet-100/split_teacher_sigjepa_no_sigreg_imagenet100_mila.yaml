@@ -1,0 +1,112 @@
+defaults:
+- _self_
+- wandb: private.yaml
+- override hydra/hydra_logging: disabled
+- override hydra/job_logging: disabled
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+name: split-teacher-jepa-no-sigreg-imagenet100
+method: split_teacher_sigjepa
+backbone:
+  name: vit_base
+  kwargs:
+    patch_size: 14
+method_kwargs:
+  proj_hidden_dim: 2048
+  proj_output_dim: 2048
+  compatible_dim: 1024
+  free_dim: 1024
+  lambda_pred: 1.0
+  lambda_teacher: 1.0
+  lambda_sigreg: 0.0
+  sigreg_num_slices: 256
+  sigreg_num_points: 17
+  sigreg_t_min: -5.0
+  sigreg_t_max: 5.0
+  sigreg_use_real: false
+  teacher_backend: hf_dinov2
+  teacher_model_id: facebook/dinov2-large
+  teacher_local_dir: null
+  teacher_pooling: cls
+  teacher_output_dim: 1024
+  teacher_chunk_size: 16
+  teacher_use_same_views: true
+  teacher_eager_load: false
+  teacher_prefetch:
+    enabled: false
+    cache_dir: teacher_prefetch_cache/${name}
+    num_epochs: ${max_epochs}
+    epoch_mode: wrap
+    dtype: float16
+    base_seed: ${seed}
+    batch_size: ${optimizer.batch_size}
+    num_workers: ${data.num_workers}
+    overwrite: false
+  projector_type: mlp
+  add_projector_classifier: true
+  logging_interval: 50
+mlp_probe:
+  enabled: false
+  num_layers: 3
+data:
+  dataset: imagenet100
+  train_path: ./datasets/imagenet100/train
+  val_path: ./datasets/imagenet100/val
+  preload: true
+  format: image_folder
+  num_workers: 8
+augmentations:
+- rrc:
+    enabled: true
+    crop_min_scale: 0.2
+    crop_max_scale: 1.0
+  color_jitter:
+    enabled: true
+    brightness: 0.4
+    contrast: 0.4
+    saturation: 0.2
+    hue: 0.1
+    prob: 0.8
+  grayscale:
+    enabled: true
+    prob: 0.2
+  gaussian_blur:
+    enabled: true
+    prob: 0.5
+  solarization:
+    enabled: true
+    prob: 0.1
+  equalization:
+    enabled: false
+    prob: 0.0
+  horizontal_flip:
+    enabled: true
+    prob: 0.5
+  crop_size: 224
+  num_crops: 2
+optimizer:
+  name: adamw
+  batch_size: 128
+  lr: 5e-4
+  classifier_lr: 5e-3
+  weight_decay: 1e-4
+scheduler:
+  name: warmup_cosine
+checkpoint:
+  enabled: true
+  dir: trained_models
+  frequency: 1
+auto_resume:
+  enabled: true
+max_epochs: 1000
+devices:
+- 0
+- 1
+- 2
+num_nodes: 1
+sync_batchnorm: true
+accelerator: gpu
+strategy: ddp
+precision: 16-mixed
