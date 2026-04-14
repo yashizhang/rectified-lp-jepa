@@ -54,7 +54,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   ++wandb.project=jepa \
   ++wandb.enabled=true
 
-# B6. Proposed split-teacher SIGJEPA with the default ViT-B/14 student and DinoV2 ViT-L/14 teacher.
+# B6. Proposed split-teacher SIGJEPA with the default ViT-S/14 student and DinoV2 ViT-B/14 teacher.
 CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   --config-path=scripts/pretrain/imagenet-100/ \
   --config-name=split_teacher_sigjepa_imagenet100.yaml \
@@ -70,14 +70,14 @@ CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   ++wandb.project=jepa \
   ++wandb.enabled=true
 
-# Optional: swap in a DinoV2-with-registers checkpoint while keeping the same student recipe.
+# Optional: swap in a DinoV2-with-registers base checkpoint while keeping the same student recipe.
 CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   --config-path=scripts/pretrain/imagenet-100/ \
   --config-name=split_teacher_sigjepa_imagenet100.yaml \
   ++method_kwargs.teacher_backend=hf_dinov2_with_registers \
-  ++method_kwargs.teacher_model_id=facebook/dinov2-with-registers-large \
+  ++method_kwargs.teacher_model_id=facebook/dinov2-with-registers-base \
   ++method_kwargs.teacher_pooling=cls \
-  ++method_kwargs.teacher_output_dim=1024 \
+  ++method_kwargs.teacher_output_dim=768 \
   ++wandb.entity=yashi-zhang \
   ++wandb.project=jepa \
   ++wandb.enabled=true
