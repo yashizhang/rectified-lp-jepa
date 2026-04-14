@@ -122,9 +122,9 @@ The repository also includes a **split teacher + SIGReg JEPA** path in which:
 The default ImageNet-100 config is:
 
 - `scripts/pretrain/imagenet-100/split_teacher_sigjepa_imagenet100.yaml`
-- student backbone: `vit_base` with `patch_size=14`
+- student backbone: `vit_small` with `patch_size=14`
 - teacher backend: `hf_dinov2`
-- teacher model id: `facebook/dinov2-large`
+- teacher model id: `facebook/dinov2-base`
 - teacher pooling: `cls`
 
 ### Online DinoV2 teacher

@@ -756,5 +756,6 @@ def prepare_dataloader(
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=drop_last,
+        prefetch_factor=8,
     )
     return train_loader

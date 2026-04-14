@@ -1,4 +1,11 @@
 ```bash
+# To disable classifier during training:
+  ++optimizer.classifier_lr=0 \
+  ++method_kwargs.add_projector_classifier=false \
+  ++mlp_probe.enabled=false
+```
+
+```bash
 # B0. Existing repo baseline: Rectified LpJEPA
 CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   --config-path=scripts/pretrain/imagenet-100/ \
@@ -31,7 +38,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   ++wandb.project=jepa \
   ++wandb.enabled=true
 
-# B4. Split, no teacher
+# B4. No teacher, full z_f (compatible_dim=0, free_dim=2048)
 CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   --config-path=scripts/pretrain/imagenet-100/ \
   --config-name=split_teacher_sigjepa_no_teacher_imagenet100.yaml \
@@ -39,7 +46,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   ++wandb.project=jepa \
   ++wandb.enabled=true
 
-# B5. Split, no SIGReg
+# B5. No SIGReg, full z_c (compatible_dim=2048, free_dim=0)
 CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   --config-path=scripts/pretrain/imagenet-100/ \
   --config-name=split_teacher_sigjepa_no_sigreg_imagenet100.yaml \

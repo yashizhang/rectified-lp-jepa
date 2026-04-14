@@ -50,18 +50,18 @@ _TEACHER_BACKEND_DEFAULTS: Dict[str, TeacherBackendDefaults] = {
         pooling="mean",
     ),
     "hf_dinov2": TeacherBackendDefaults(
-        model_id="facebook/dinov2-large",
-        output_dim=1024,
+        model_id="facebook/dinov2-base",
+        output_dim=768,
         pooling="cls",
     ),
     "hf_dinov2_with_registers": TeacherBackendDefaults(
-        model_id="facebook/dinov2-with-registers-large",
-        output_dim=1024,
+        model_id="facebook/dinov2-with-registers-base",
+        output_dim=768,
         pooling="cls",
     ),
     "hf_auto": TeacherBackendDefaults(
-        model_id="facebook/dinov2-large",
-        output_dim=1024,
+        model_id="facebook/dinov2-base",
+        output_dim=768,
         pooling="cls",
     ),
 }

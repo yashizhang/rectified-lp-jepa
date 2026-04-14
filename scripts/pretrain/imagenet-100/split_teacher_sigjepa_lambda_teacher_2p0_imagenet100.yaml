@@ -10,7 +10,7 @@ hydra:
 name: split-teacher-sigjepa-lambda-teacher-2p0-imagenet100
 method: split_teacher_sigjepa
 backbone:
-  name: vit_base
+  name: vit_small
   kwargs:
     patch_size: 14
 method_kwargs:
@@ -27,10 +27,10 @@ method_kwargs:
   sigreg_t_max: 5.0
   sigreg_use_real: false
   teacher_backend: hf_dinov2
-  teacher_model_id: facebook/dinov2-large
+  teacher_model_id: facebook/dinov2-base
   teacher_local_dir: null
   teacher_pooling: cls
-  teacher_output_dim: 1024
+  teacher_output_dim: 768
   teacher_chunk_size: 16
   teacher_use_same_views: true
   teacher_eager_load: false

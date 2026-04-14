@@ -31,7 +31,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   ++wandb.project=jepa \
   ++wandb.enabled=true
 
-# B4. Split, no teacher
+# B4. No teacher, full z_f (compatible_dim=0, free_dim=2048)
 CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   --config-path=scripts/pretrain/imagenet-100/ \
   --config-name=split_teacher_sigjepa_no_teacher_imagenet100_mila.yaml \
@@ -39,13 +39,18 @@ CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   ++wandb.project=jepa \
   ++wandb.enabled=true
 
-# B5. Split, no SIGReg
+CUDA_VISIBLE_DEVICES=0,1 python3 main_pretrain.py     --config-path=scripts/pretrain/imagenet-100/     --config-name=split_teacher_sigjepa_no_teacher_imagenet100_mila.yaml     devices=[0,1]     optimizer.batch_size=64     data.preload=false     strategy=ddp_find_unused_parameters_true     ++wandb.entity=yashi-zhang     ++wandb.project=jepa     ++wandb.enabled=true
+
+
+# B5. No SIGReg, full z_c (compatible_dim=2048, free_dim=0)
 CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   --config-path=scripts/pretrain/imagenet-100/ \
   --config-name=split_teacher_sigjepa_no_sigreg_imagenet100_mila.yaml \
   ++wandb.entity=yashi-zhang \
   ++wandb.project=jepa \
   ++wandb.enabled=true
+
+CUDA_VISIBLE_DEVICES=0,1 python3 main_pretrain.py     --config-path=scripts/pretrain/imagenet-100/     --config-name=split_teacher_sigjepa_no_sigreg_imagenet100_mila.yaml     devices=[0,1]     optimizer.batch_size=64     data.preload=false     strategy=ddp_find_unused_parameters_true     ++wandb.entity=yashi-zhang     ++wandb.project=jepa     ++wandb.enabled=true
 
 # B6. Proposed split-teacher SIGJEPA with the default ViT-B/14 student and DinoV2 ViT-L/14 teacher.
 CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
