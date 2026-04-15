@@ -60,6 +60,8 @@ CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   ++wandb.project=jepa \
   ++wandb.enabled=true
 
+CUDA_VISIBLE_DEVICES=0,1 python3 main_pretrain.py     --config-path=scripts/pretrain/imagenet-100/     --config-name=split_teacher_sigjepa_imagenet100_mila.yaml     devices=[0,1]     optimizer.batch_size=64     data.preload=false     strategy=ddp_find_unused_parameters_true     ++wandb.entity=yashi-zhang     ++wandb.project=jepa     ++wandb.enabled=true
+
 # Optional: explicit B6 alias config with the same defaults.
 CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   --config-path=scripts/pretrain/imagenet-100/ \
