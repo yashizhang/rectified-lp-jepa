@@ -32,13 +32,34 @@ from solo.utils.metrics import (
 )
 
 # =========================
-# Invariance Loss
+# Invariance / Prediction Losses
 # =========================
 def invariance_loss(z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
     """Computes mse loss given batch of projected features z1 from view 1 and
     projected features z2 from view 2.
     """
     return F.mse_loss(z1, z2)
+
+
+def multicrop_predictive_loss(global_views, all_views) -> torch.Tensor:
+    """LeJEPA-style predictive loss.
+
+    The global views are averaged into a per-sample center and every view
+    (global + local) predicts that center.
+    """
+
+    if len(global_views) == 2 and len(all_views) == 2:
+        # Preserve the original 2-view behavior for backward compatibility.
+        return invariance_loss(global_views[0], global_views[1])
+
+    if len(global_views) == 0:
+        raise ValueError("At least one global view is required.")
+    if len(all_views) == 0:
+        raise ValueError("At least one view is required.")
+
+    centers = torch.stack(global_views, dim=0).mean(dim=0)
+    stacked_views = torch.stack(all_views, dim=0)
+    return F.mse_loss(stacked_views, centers.unsqueeze(0).expand_as(stacked_views))
 
 # =========================
 # Generalized Gaussian Distribution Sampling
@@ -211,20 +232,41 @@ def sliced_wasserstein_distance_for_one_view(features, projection_vectors, targe
     return torch.mean(wasserstein_1d)
 
 def rdmreg_loss(z1, z2, projection_vectors, target_dist, mean_shift_value=0.0, lp_norm_parameter=1.0, chosen_sigma=None):
-    """
-    Computes the Sliced Wasserstein Distance (RDMReg) loss across two views.
-    """
-    if isinstance(projection_vectors, list) and len(projection_vectors) == 2:
-        # Case for SVD-based projections where each view has its own projection matrix
-        swd_loss_z1 = sliced_wasserstein_distance_for_one_view(z1, projection_vectors[0], target_dist, mean_shift_value, lp_norm_parameter, chosen_sigma)
-        swd_loss_z2 = sliced_wasserstein_distance_for_one_view(z2, projection_vectors[1], target_dist, mean_shift_value, lp_norm_parameter, chosen_sigma)
+    """Backward-compatible 2-view RDMReg wrapper."""
+    return rdmreg_loss_multiview(
+        [z1, z2],
+        projection_vectors,
+        target_dist,
+        mean_shift_value=mean_shift_value,
+        lp_norm_parameter=lp_norm_parameter,
+        chosen_sigma=chosen_sigma,
+    )
+
+
+def rdmreg_loss_multiview(views, projection_vectors, target_dist, mean_shift_value=0.0, lp_norm_parameter=1.0, chosen_sigma=None):
+    """Computes the Sliced Wasserstein Distance (RDMReg) loss across an arbitrary number of views."""
+
+    if len(views) == 0:
+        raise ValueError("At least one view is required for RDMReg.")
+
+    if isinstance(projection_vectors, list):
+        if len(projection_vectors) != len(views):
+            raise ValueError(
+                f"Expected one projection matrix per view, got {len(projection_vectors)} for {len(views)} views."
+            )
+        losses = [
+            sliced_wasserstein_distance_for_one_view(view, proj, target_dist, mean_shift_value, lp_norm_parameter, chosen_sigma)
+            for view, proj in zip(views, projection_vectors)
+        ]
     elif isinstance(projection_vectors, torch.Tensor):
-        # Case for random projections shared across views
-        swd_loss_z1 = sliced_wasserstein_distance_for_one_view(z1, projection_vectors, target_dist, mean_shift_value, lp_norm_parameter, chosen_sigma)
-        swd_loss_z2 = sliced_wasserstein_distance_for_one_view(z2, projection_vectors, target_dist, mean_shift_value, lp_norm_parameter, chosen_sigma)
+        losses = [
+            sliced_wasserstein_distance_for_one_view(view, projection_vectors, target_dist, mean_shift_value, lp_norm_parameter, chosen_sigma)
+            for view in views
+        ]
     else:
         raise ValueError("Invalid projection_vectors type")
-    return (swd_loss_z1 + swd_loss_z2) / 2
+
+    return torch.stack(losses).mean()
 
 # =========================
 # Main Rectified LpJEPA Loss
@@ -240,19 +282,60 @@ def rectified_lp_jepa_loss(
     lp_norm_parameter: float = 1.0,
     chosen_sigma: float = None,
 ):
+    """Backward-compatible 2-view Rectified LpJEPA loss."""
+    return rectified_lp_jepa_multicrop_loss(
+        global_views=[z1, z2],
+        all_views=[z1, z2],
+        gathered_views=None,
+        projection_vectors=projection_vectors,
+        target_distribution=target_distribution,
+        invariance_loss_weight=invariance_loss_weight,
+        rdm_reg_loss_weight=rdm_reg_loss_weight,
+        mean_shift_value=mean_shift_value,
+        lp_norm_parameter=lp_norm_parameter,
+        chosen_sigma=chosen_sigma,
+    )
+
+
+# =========================
+# Multi-crop Rectified LpJEPA Loss
+# =========================
+def rectified_lp_jepa_multicrop_loss(
+    global_views,
+    all_views,
+    projection_vectors,
+    target_distribution: str,
+    invariance_loss_weight: float,
+    rdm_reg_loss_weight: float,
+    mean_shift_value: float = 0.0,
+    lp_norm_parameter: float = 1.0,
+    chosen_sigma: float = None,
+    gathered_views=None,
+):
+    """Computes the LeJEPA-style multi-crop Rectified LpJEPA loss.
+
+    Args:
+        global_views: sequence of global-view embeddings.
+        all_views: sequence of all view embeddings (global + local).
+        gathered_views: optional gathered version of ``all_views`` for RDMReg.
+            If omitted, each view is gathered internally, matching the original behavior.
     """
-    Computes the total Rectified LpJEPA loss: Invariance + RDMReg.
-    Variance and Covariance terms are logged but never optimized.
-    """
-    # 1. Invariance Loss
-    sim_loss = invariance_loss(z1, z2)
-    
-    # Gather across GPUs for global statistics
-    z1_gathered, z2_gathered = gather(z1), gather(z2)
-    
-    # 3. RDMReg Loss (Distribution Matching)
-    reg_loss = rdmreg_loss(z1_gathered, z2_gathered, projection_vectors, target_distribution, mean_shift_value, lp_norm_parameter, chosen_sigma)
-    
-    # Total weighted loss - Variance and Covariance are logged separately in training_step
+
+    sim_loss = multicrop_predictive_loss(global_views, all_views)
+
+    if gathered_views is None:
+        reg_views = [gather(view) for view in all_views]
+    else:
+        reg_views = list(gathered_views)
+
+    reg_loss = rdmreg_loss_multiview(
+        reg_views,
+        projection_vectors,
+        target_distribution,
+        mean_shift_value=mean_shift_value,
+        lp_norm_parameter=lp_norm_parameter,
+        chosen_sigma=chosen_sigma,
+    )
+
     loss = (invariance_loss_weight * sim_loss) + (rdm_reg_loss_weight * reg_loss)
     return loss, sim_loss, reg_loss
