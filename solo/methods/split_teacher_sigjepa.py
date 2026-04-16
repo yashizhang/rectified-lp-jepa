@@ -265,6 +265,11 @@ class SplitTeacherSIGJEPA(BaseMethod):
             cfg, "method_kwargs.add_projector_classifier", True
         )
 
+        if str(cfg.backbone.name).startswith("vit") and int(cfg.data.num_small_crops) > 0:
+            cfg.backbone.kwargs.dynamic_img_size = omegaconf_select(
+                cfg, "backbone.kwargs.dynamic_img_size", True
+            )
+
         return cfg
 
     @property
@@ -332,76 +337,84 @@ class SplitTeacherSIGJEPA(BaseMethod):
             )
         return F.normalize(cached[:, 0], dim=1), F.normalize(cached[:, 1], dim=1)
 
-    def forward(self, X: torch.Tensor) -> Dict[str, Any]:
-        out = super().forward(X)
-        z = self.projector(out["feats"])
+    def _split_projector_output(self, feats: torch.Tensor) -> Dict[str, torch.Tensor]:
+        z = self.projector(feats)
         z_c = z[:, : self.compatible_dim]
         z_f = z[:, self.compatible_dim :]
-
-        out.update({
+        return {
             "z": z,
             "z_c": z_c,
             "z_f": z_f,
-        })
+        }
+
+    def forward(self, X: torch.Tensor) -> Dict[str, Any]:
+        out = super().forward(X)
+        out.update(self._split_projector_output(out["feats"]))
 
         if self.projector_classifier is not None:
-            out["projector_logits"] = self.projector_classifier(z.detach())
+            out["projector_logits"] = self.projector_classifier(out["z"].detach())
+        return out
+
+    def multicrop_forward(self, X: torch.Tensor) -> Dict[str, Any]:
+        out = super().multicrop_forward(X)
+        out.update(self._split_projector_output(out["feats"]))
         return out
 
     def training_step(self, batch: Sequence[Any], batch_idx: int) -> torch.Tensor:
         out = super().training_step(batch, batch_idx)
         class_loss = out["loss"]
 
-        z1, z2 = out["z"]
-        z_c1, z_c2 = out["z_c"]
-        z_f1, z_f2 = out["z_f"]
+        all_z: List[torch.Tensor] = list(out["z"])
+        global_z = all_z[: self.num_large_crops]
+
+        all_z_c: List[torch.Tensor] = list(out["z_c"])
+        global_z_c = all_z_c[: self.num_large_crops]
+
+        all_z_f: List[torch.Tensor] = list(out["z_f"])
 
         img_indexes, X, _targets = batch
         X = [X] if isinstance(X, torch.Tensor) else X
-        x1, x2 = X[:2]
+        global_views = X[: self.num_large_crops]
 
         if self.use_teacher_branch:
             assert self.align_head is not None
-            a1 = F.normalize(self.align_head(z_c1), dim=1)
-            a2 = F.normalize(self.align_head(z_c2), dim=1)
+            aligned_globals = [F.normalize(self.align_head(z_c), dim=1) for z_c in global_z_c]
             with torch.no_grad():
                 if self.teacher_prefetch_cache is not None:
-                    t1, t2 = self._get_prefetched_teacher_targets(img_indexes, device=x1.device)
+                    teacher_globals = list(
+                        self._get_prefetched_teacher_targets(img_indexes, device=global_views[0].device)
+                    )
                 else:
                     if self.teacher is None:
                         raise RuntimeError(
                             "Teacher branch is enabled, but neither an online teacher nor a "
                             "teacher_prefetch cache is available."
                         )
-                    t1 = F.normalize(self.teacher(x1), dim=1)
-                    t2 = F.normalize(self.teacher(x2), dim=1)
+                    teacher_globals = [
+                        F.normalize(self.teacher(view), dim=1) for view in global_views
+                    ]
         else:
-            a1 = a2 = t1 = t2 = None
+            aligned_globals = teacher_globals = None
 
-        ssl_loss, pred_loss, teacher_loss, free_loss, free_loss_zf1, free_loss_zf2 = (
-            split_teacher_sigjepa_loss(
-                z1=z1,
-                z2=z2,
-                a1=a1,
-                a2=a2,
-                t1=t1,
-                t2=t2,
-                z_f1=z_f1 if self.use_free_branch else None,
-                z_f2=z_f2 if self.use_free_branch else None,
-                global_step=self.global_step,
-                lambda_pred=self.lambda_pred,
-                lambda_teacher=self.lambda_teacher,
-                lambda_sigreg=self.lambda_sigreg,
-                num_slices=self.sigreg_num_slices,
-                num_points=self.sigreg_num_points,
-                t_min=self.sigreg_t_min,
-                t_max=self.sigreg_t_max,
-                sigreg_use_real=self.sigreg_use_real,
-                ddp_sync=True,
-            )
+        ssl_loss, pred_loss, teacher_loss, free_loss, free_loss_per_view = split_teacher_sigjepa_loss(
+            global_latents=global_z,
+            all_latents=all_z,
+            aligned_globals=aligned_globals,
+            teacher_globals=teacher_globals,
+            free_views=all_z_f if self.use_free_branch else None,
+            global_step=self.global_step,
+            lambda_pred=self.lambda_pred,
+            lambda_teacher=self.lambda_teacher,
+            lambda_sigreg=self.lambda_sigreg,
+            num_slices=self.sigreg_num_slices,
+            num_points=self.sigreg_num_points,
+            t_min=self.sigreg_t_min,
+            t_max=self.sigreg_t_max,
+            sigreg_use_real=self.sigreg_use_real,
+            ddp_sync=True,
         )
 
-        projector_class_loss = z1.new_zeros(())
+        projector_class_loss = global_z[0].new_zeros(())
         if self.projector_classifier is not None and "proj_loss" in out:
             projector_class_loss = sum(out["proj_loss"]) / len(out["proj_loss"])
             self.log("train_proj_loss", projector_class_loss, on_epoch=True, sync_dist=True)
@@ -418,18 +431,23 @@ class SplitTeacherSIGJEPA(BaseMethod):
                 sync_dist=True,
             )
 
-        teacher_cosine = z1.new_zeros(())
-        if self.use_teacher_branch and a1 is not None and a2 is not None and t1 is not None and t2 is not None:
-            teacher_cosine = 0.5 * (
-                (a1 * t1).sum(dim=1).mean() + (a2 * t2).sum(dim=1).mean()
-            )
+        teacher_cosine = global_z[0].new_zeros(())
+        if self.use_teacher_branch and aligned_globals is not None and teacher_globals is not None:
+            teacher_cosine = torch.stack(
+                [(student * teacher).sum(dim=1).mean() for student, teacher in zip(aligned_globals, teacher_globals)]
+            ).mean()
 
-        zc_norm = z_c1.new_zeros(()) if self.compatible_dim == 0 else 0.5 * (
-            z_c1.norm(dim=1).mean() + z_c2.norm(dim=1).mean()
-        )
-        zf_norm = z_f1.new_zeros(()) if self.free_dim == 0 else 0.5 * (
-            z_f1.norm(dim=1).mean() + z_f2.norm(dim=1).mean()
-        )
+        zc_views = [z for z in all_z_c if z.numel() > 0]
+        if zc_views:
+            zc_norm = torch.stack([z.norm(dim=1).mean() for z in zc_views]).mean()
+        else:
+            zc_norm = global_z[0].new_zeros(())
+
+        zf_views = [z for z in all_z_f if z.numel() > 0]
+        if zf_views:
+            zf_norm = torch.stack([z.norm(dim=1).mean() for z in zf_views]).mean()
+        else:
+            zf_norm = global_z[0].new_zeros(())
 
         self.log("train_split_teacher_sigjepa_loss", ssl_loss, on_epoch=True, sync_dist=True)
         self.log("train_pred_loss", pred_loss, on_epoch=True, sync_dist=True)
@@ -440,20 +458,26 @@ class SplitTeacherSIGJEPA(BaseMethod):
         self.log("train_zf_norm", zf_norm, on_epoch=True, sync_dist=True)
 
         if self.global_step % self.logging_interval == 0:
-            var_zc = z_c1.new_zeros(()) if self.compatible_dim == 0 else 0.5 * (
-                z_c1.var(dim=0).mean() + z_c2.var(dim=0).mean()
-            )
-            var_zf = z_f1.new_zeros(()) if self.free_dim == 0 else 0.5 * (
-                z_f1.var(dim=0).mean() + z_f2.var(dim=0).mean()
-            )
-            cov_full_z = 0.5 * (
-                _off_diagonal_covariance_energy(z1) + _off_diagonal_covariance_energy(z2)
-            )
+            if zc_views:
+                var_zc = torch.stack([z.var(dim=0).mean() for z in zc_views]).mean()
+            else:
+                var_zc = global_z[0].new_zeros(())
+            if zf_views:
+                var_zf = torch.stack([z.var(dim=0).mean() for z in zf_views]).mean()
+            else:
+                var_zf = global_z[0].new_zeros(())
+            cov_full_z = torch.stack([_off_diagonal_covariance_energy(z) for z in all_z]).mean()
             self.log("train_var_zc", var_zc, on_epoch=True, sync_dist=True)
             self.log("train_var_zf", var_zf, on_epoch=True, sync_dist=True)
             self.log("train_cov_full_z", cov_full_z, on_epoch=True, sync_dist=True)
-            self.log("train_sigreg_zf1", free_loss_zf1, on_epoch=True, sync_dist=True)
-            self.log("train_sigreg_zf2", free_loss_zf2, on_epoch=True, sync_dist=True)
+
+            if len(free_loss_per_view) >= 1:
+                self.log("train_sigreg_zf1", free_loss_per_view[0], on_epoch=True, sync_dist=True)
+            if len(free_loss_per_view) >= 2:
+                self.log("train_sigreg_zf2", free_loss_per_view[1], on_epoch=True, sync_dist=True)
+            if len(free_loss_per_view) > self.num_large_crops:
+                local_mean = torch.stack(free_loss_per_view[self.num_large_crops :]).mean()
+                self.log("train_sigreg_zf_local_mean", local_mean, on_epoch=True, sync_dist=True)
 
         total = ssl_loss + class_loss + projector_class_loss
         return total

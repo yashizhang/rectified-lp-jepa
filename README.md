@@ -127,6 +127,8 @@ The default ImageNet-100 config is:
 - teacher model id: `facebook/dinov2-base`
 - teacher pooling: `cls`
 
+The plain `sigjepa_imagenet100*.yaml` configs now use the LeJEPA-style multi-crop recipe: **2 global 224x224 views** plus **6 local 98x98 views**.
+
 ### Online DinoV2 teacher
 
 ```bash

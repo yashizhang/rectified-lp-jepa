@@ -14,7 +14,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   ++wandb.project=jepa \
   ++wandb.enabled=true
 
-# B1. Plain SIGReg JEPA (config-only via split_teacher_sigjepa with compatible_dim=0, free_dim=2048)
+# B1. Plain SIGReg JEPA (LeJEPA-style 2 global + 6 local multi-crop; config-only via split_teacher_sigjepa with compatible_dim=0, free_dim=2048)
 CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   --config-path=scripts/pretrain/imagenet-100/ \
   --config-name=sigjepa_imagenet100.yaml \

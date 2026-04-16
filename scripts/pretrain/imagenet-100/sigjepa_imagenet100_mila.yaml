@@ -13,6 +13,7 @@ backbone:
   name: vit_small
   kwargs:
     patch_size: 14
+    dynamic_img_size: true
 method_kwargs:
   proj_hidden_dim: 2048
   proj_output_dim: 2048
@@ -60,7 +61,7 @@ data:
 augmentations:
 - rrc:
     enabled: true
-    crop_min_scale: 0.2
+    crop_min_scale: 0.3
     crop_max_scale: 1.0
   color_jitter:
     enabled: true
@@ -77,7 +78,7 @@ augmentations:
     prob: 0.5
   solarization:
     enabled: true
-    prob: 0.1
+    prob: 0.2
   equalization:
     enabled: false
     prob: 0.0
@@ -86,6 +87,34 @@ augmentations:
     prob: 0.5
   crop_size: 224
   num_crops: 2
+- rrc:
+    enabled: true
+    crop_min_scale: 0.05
+    crop_max_scale: 0.3
+  color_jitter:
+    enabled: true
+    brightness: 0.4
+    contrast: 0.4
+    saturation: 0.2
+    hue: 0.1
+    prob: 0.8
+  grayscale:
+    enabled: true
+    prob: 0.2
+  gaussian_blur:
+    enabled: true
+    prob: 0.5
+  solarization:
+    enabled: true
+    prob: 0.2
+  equalization:
+    enabled: false
+    prob: 0.0
+  horizontal_flip:
+    enabled: true
+    prob: 0.5
+  crop_size: 98
+  num_crops: 6
 optimizer:
   name: adamw
   batch_size: 128
