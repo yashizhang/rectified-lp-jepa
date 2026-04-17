@@ -170,3 +170,10 @@ CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py \
   ++wandb.project=jepa \
   ++wandb.enabled=true
 ```
+
+no teacher baseline comparisons:
+```
+CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py     --config-path=scripts/pretrain/imagenet-100/     --config-name=sigjepa_no_teacher.yaml     devices=[0,1,2]     optimizer.batch_size=64     data.preload=true     strategy=ddp     ++wandb.entity=yashi-zhang     ++wandb.project=jepa     ++wandb.enabled=true
+
+CUDA_VISIBLE_DEVICES=0,1,2 python3 main_pretrain.py     --config-path=scripts/pretrain/imagenet-100/     --config-name=sigjepa_allfree_baseline.yaml     devices=[0,1,2]     optimizer.batch_size=64     data.preload=true     strategy=ddp     ++wandb.entity=yashi-zhang     ++wandb.project=jepa     ++wandb.enabled=true
+```

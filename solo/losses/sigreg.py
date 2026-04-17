@@ -78,7 +78,7 @@ def _sync_projected(projected: torch.Tensor, ddp_sync: bool) -> torch.Tensor:
 def sigreg(
     x: torch.Tensor,
     global_step: int,
-    num_slices: int = 256,
+    num_slices: int = 1024,
     num_points: int = 17,
     t_min: float = -5.0,
     t_max: float = 5.0,
@@ -126,7 +126,7 @@ def sigreg(
 def sigreg_real(
     x: torch.Tensor,
     global_step: int,
-    num_slices: int = 256,
+    num_slices: int = 1024,
     num_points: int = 17,
     t_min: float = -5.0,
     t_max: float = 5.0,
