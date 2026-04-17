@@ -22,6 +22,8 @@ method_kwargs:
   proj_output_dim: 512
   invariance_loss_weight: 25.0
   rdm_reg_loss_weight: 250.0
+  lambda_mmd: 0.0
+  mmd_kernel: "energy"
   projector_type: "rectified_mlp"
   num_projections: 8192
   projection_vectors_type: "random"

@@ -80,7 +80,7 @@ where we update the target distribution to be the Rectified Gaussian distributio
 
 ### Varying Both Target Distributions and Other Hyperparameters
 
-Common tunable hyperparameters include `++method_kwargs.invariance_loss_weight`, `++method_kwarsg.rdm_reg_loss_weight`, which are hyperparameters for the invariance and the RDMReg loss respectively. The learning rates `++optimizer.lr` and `++optimizer.classifier_lr` can also be changed accordingly. One example script to include all these arguments is
+Common tunable hyperparameters include `++method_kwargs.invariance_loss_weight`, `++method_kwarsg.rdm_reg_loss_weight`, and the optional GeomLoss MMD term `++method_kwargs.lambda_mmd` with `++method_kwargs.mmd_kernel in {energy, gaussian, laplacian}`. The learning rates `++optimizer.lr` and `++optimizer.classifier_lr` can also be changed accordingly. One example script to include all these arguments is
 
 ```bash
 python3 main_pretrain.py \
@@ -90,12 +90,16 @@ python3 main_pretrain.py \
   ++method_kwargs.mean_shift_value=-1.0 \
   ++method_kwargs.invariance_loss_weight=25.0 \
   ++method_kwarsg.rdm_reg_loss_weight=125.0 \
+  ++method_kwargs.lambda_mmd=1.0 \
+  ++method_kwargs.mmd_kernel=energy \
   ++optimizer.lr=0.165 \
   ++optimizer.lr=0.055 \
   ++wandb.entity=<ENTITY> \
   ++wandb.project=<PROJECT> \
   ++wandb.enabled=true # set to false for debugging
 ```
+
+`lambda_mmd` defaults to `0.0`, so existing configs keep the previous behavior. When `mmd_kernel` is set to `gaussian` or `laplacian`, the kernel width is tied to the target distribution scale used by Rectified LpJEPA.
 
 
 <!-- For a complete SLURM-ready reproduction script, refer to:
