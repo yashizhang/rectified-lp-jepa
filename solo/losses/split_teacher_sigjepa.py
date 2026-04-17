@@ -22,6 +22,7 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
+from solo.losses.mmd import mmd_regularization_loss
 from solo.losses.sigreg import sigreg, sigreg_real
 
 
@@ -117,17 +118,29 @@ def split_teacher_sigjepa_loss(
     lambda_pred: float = 1.0,
     lambda_teacher: float = 1.0,
     lambda_sigreg: float = 0.05,
+    lambda_mmd: float = 0.0,
+    mmd_kernel: str = "energy",
+    mmd_views: Optional[Sequence[torch.Tensor]] = None,
     num_slices: int = 256,
     num_points: int = 17,
     t_min: float = -5.0,
     t_max: float = 5.0,
     sigreg_use_real: bool = False,
     ddp_sync: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    List[torch.Tensor],
+    List[torch.Tensor],
+]:
     """Returns total SSL loss and its main components.
 
     Output order:
-        total_ssl_loss, pred_loss, teacher_loss, free_loss, free_loss_per_view
+        total_ssl_loss, pred_loss, teacher_loss, free_sigreg_loss,
+        mmd_loss, free_sigreg_loss_per_view, mmd_loss_per_view
     """
 
     if len(global_latents) == 0:
@@ -158,5 +171,23 @@ def split_teacher_sigjepa_loss(
         free = ref.new_zeros(())
         free_per_view = []
 
-    total = lambda_pred * pred + lambda_teacher * teacher + lambda_sigreg * free
-    return total, pred, teacher, free, free_per_view
+    if lambda_mmd > 0:
+        if mmd_views is None:
+            mmd_views = all_latents
+        mmd, mmd_per_view = mmd_regularization_loss(
+            mmd_views,
+            global_step=global_step,
+            kernel=mmd_kernel,
+            ddp_sync=ddp_sync,
+        )
+    else:
+        mmd = ref.new_zeros(())
+        mmd_per_view = []
+
+    total = (
+        lambda_pred * pred
+        + lambda_teacher * teacher
+        + lambda_sigreg * free
+        + lambda_mmd * mmd
+    )
+    return total, pred, teacher, free, mmd, free_per_view, mmd_per_view

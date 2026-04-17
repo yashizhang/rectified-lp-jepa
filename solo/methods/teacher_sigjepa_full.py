@@ -48,6 +48,8 @@ class TeacherSIGJEPAFull(BaseMethod):
         self.lambda_pred: float = float(cfg.method_kwargs.lambda_pred)
         self.lambda_teacher: float = float(cfg.method_kwargs.lambda_teacher)
         self.lambda_sigreg: float = float(cfg.method_kwargs.lambda_sigreg)
+        self.lambda_mmd: float = float(cfg.method_kwargs.lambda_mmd)
+        self.mmd_kernel: str = str(cfg.method_kwargs.mmd_kernel).lower()
 
         self.projector_type: str = cfg.method_kwargs.projector_type
         self.proj_output_dim: int = int(cfg.method_kwargs.proj_output_dim)
@@ -57,6 +59,11 @@ class TeacherSIGJEPAFull(BaseMethod):
         self.sigreg_t_max: float = float(cfg.method_kwargs.sigreg_t_max)
         self.sigreg_use_real: bool = bool(cfg.method_kwargs.sigreg_use_real)
         self.teacher_use_same_views: bool = bool(cfg.method_kwargs.teacher_use_same_views)
+
+        if self.lambda_mmd > 0:
+            assert self.mmd_kernel in {"energy", "gaussian", "laplacian"}, (
+                "mmd_kernel must be one of: energy, gaussian, laplacian."
+            )
 
         if self.num_large_crops != 2:
             raise ValueError(
@@ -119,6 +126,14 @@ class TeacherSIGJEPAFull(BaseMethod):
         cfg.method_kwargs.lambda_pred = omegaconf_select(cfg, "method_kwargs.lambda_pred", 1.0)
         cfg.method_kwargs.lambda_teacher = omegaconf_select(cfg, "method_kwargs.lambda_teacher", 1.0)
         cfg.method_kwargs.lambda_sigreg = omegaconf_select(cfg, "method_kwargs.lambda_sigreg", 0.05)
+        cfg.method_kwargs.lambda_mmd = omegaconf_select(cfg, "method_kwargs.lambda_mmd", 0.0)
+        cfg.method_kwargs.mmd_kernel = str(
+            omegaconf_select(cfg, "method_kwargs.mmd_kernel", "energy")
+        ).lower()
+        if cfg.method_kwargs.mmd_kernel not in {"energy", "gaussian", "laplacian"}:
+            raise ValueError(
+                "method_kwargs.mmd_kernel must be one of: energy, gaussian, laplacian."
+            )
 
         cfg.method_kwargs.sigreg_num_slices = omegaconf_select(
             cfg, "method_kwargs.sigreg_num_slices", 256
@@ -185,6 +200,10 @@ class TeacherSIGJEPAFull(BaseMethod):
     def use_sigreg_branch(self) -> bool:
         return self.lambda_sigreg > 0
 
+    @property
+    def use_mmd_branch(self) -> bool:
+        return self.lambda_mmd > 0
+
     def forward(self, X: torch.Tensor) -> Dict[str, Any]:
         out = super().forward(X)
         z = self.projector(out["feats"])
@@ -214,27 +233,33 @@ class TeacherSIGJEPAFull(BaseMethod):
         else:
             a1 = a2 = t1 = t2 = None
 
-        ssl_loss, pred_loss, teacher_loss, sigreg_loss, sigreg_z1, sigreg_z2 = (
-            split_teacher_sigjepa_loss(
-                z1=z1,
-                z2=z2,
-                a1=a1,
-                a2=a2,
-                t1=t1,
-                t2=t2,
-                z_f1=z1 if self.use_sigreg_branch else None,
-                z_f2=z2 if self.use_sigreg_branch else None,
-                global_step=self.global_step,
-                lambda_pred=self.lambda_pred,
-                lambda_teacher=self.lambda_teacher,
-                lambda_sigreg=self.lambda_sigreg,
-                num_slices=self.sigreg_num_slices,
-                num_points=self.sigreg_num_points,
-                t_min=self.sigreg_t_min,
-                t_max=self.sigreg_t_max,
-                sigreg_use_real=self.sigreg_use_real,
-                ddp_sync=True,
-            )
+        (
+            ssl_loss,
+            pred_loss,
+            teacher_loss,
+            sigreg_loss,
+            mmd_loss,
+            sigreg_per_view,
+            mmd_per_view,
+        ) = split_teacher_sigjepa_loss(
+            global_latents=[z1, z2],
+            all_latents=[z1, z2],
+            aligned_globals=[a1, a2] if self.use_teacher_branch else None,
+            teacher_globals=[t1, t2] if self.use_teacher_branch else None,
+            free_views=[z1, z2] if self.use_sigreg_branch else None,
+            mmd_views=[z1, z2] if self.use_mmd_branch else None,
+            global_step=self.global_step,
+            lambda_pred=self.lambda_pred,
+            lambda_teacher=self.lambda_teacher,
+            lambda_sigreg=self.lambda_sigreg,
+            lambda_mmd=self.lambda_mmd,
+            mmd_kernel=self.mmd_kernel,
+            num_slices=self.sigreg_num_slices,
+            num_points=self.sigreg_num_points,
+            t_min=self.sigreg_t_min,
+            t_max=self.sigreg_t_max,
+            sigreg_use_real=self.sigreg_use_real,
+            ddp_sync=True,
         )
 
         projector_class_loss = z1.new_zeros(())
@@ -266,6 +291,7 @@ class TeacherSIGJEPAFull(BaseMethod):
         self.log("train_pred_loss", pred_loss, on_epoch=True, sync_dist=True)
         self.log("train_teacher_loss", teacher_loss, on_epoch=True, sync_dist=True)
         self.log("train_sigreg_loss", sigreg_loss, on_epoch=True, sync_dist=True)
+        self.log("train_mmd_loss", mmd_loss, on_epoch=True, sync_dist=True)
         self.log("train_teacher_cosine", teacher_cosine, on_epoch=True, sync_dist=True)
         self.log("train_z_norm", z_norm, on_epoch=True, sync_dist=True)
 
@@ -276,8 +302,14 @@ class TeacherSIGJEPAFull(BaseMethod):
             )
             self.log("train_var_z", var_z, on_epoch=True, sync_dist=True)
             self.log("train_cov_full_z", cov_full_z, on_epoch=True, sync_dist=True)
-            self.log("train_sigreg_z1", sigreg_z1, on_epoch=True, sync_dist=True)
-            self.log("train_sigreg_z2", sigreg_z2, on_epoch=True, sync_dist=True)
+            if len(sigreg_per_view) >= 1:
+                self.log("train_sigreg_z1", sigreg_per_view[0], on_epoch=True, sync_dist=True)
+            if len(sigreg_per_view) >= 2:
+                self.log("train_sigreg_z2", sigreg_per_view[1], on_epoch=True, sync_dist=True)
+            if len(mmd_per_view) >= 1:
+                self.log("train_mmd_z1", mmd_per_view[0], on_epoch=True, sync_dist=True)
+            if len(mmd_per_view) >= 2:
+                self.log("train_mmd_z2", mmd_per_view[1], on_epoch=True, sync_dist=True)
 
         total = ssl_loss + class_loss + projector_class_loss
         return total

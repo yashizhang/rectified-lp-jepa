@@ -10,7 +10,7 @@ hydra:
   run:
     dir: .
 
-name: "split-teacher-sigjepa-dinov2-imagenet100-mmd-0p5"
+name: "split-teacher-sigjepa-mmd-energy-0p5-dinov2-imagenet100"
 method: "split_teacher_sigjepa"
 backbone:
   name: "vit_small"

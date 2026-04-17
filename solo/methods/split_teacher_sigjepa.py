@@ -53,6 +53,8 @@ class SplitTeacherSIGJEPA(BaseMethod):
         self.lambda_pred: float = float(cfg.method_kwargs.lambda_pred)
         self.lambda_teacher: float = float(cfg.method_kwargs.lambda_teacher)
         self.lambda_sigreg: float = float(cfg.method_kwargs.lambda_sigreg)
+        self.lambda_mmd: float = float(cfg.method_kwargs.lambda_mmd)
+        self.mmd_kernel: str = str(cfg.method_kwargs.mmd_kernel).lower()
 
         self.projector_type: str = cfg.method_kwargs.projector_type
         self.compatible_dim: int = int(cfg.method_kwargs.compatible_dim)
@@ -75,6 +77,10 @@ class SplitTeacherSIGJEPA(BaseMethod):
             assert self.compatible_dim > 0, "compatible_dim must be > 0 when lambda_teacher > 0."
         if self.lambda_sigreg > 0:
             assert self.free_dim > 0, "free_dim must be > 0 when lambda_sigreg > 0."
+        if self.lambda_mmd > 0:
+            assert self.mmd_kernel in {"energy", "gaussian", "laplacian"}, (
+                "mmd_kernel must be one of: energy, gaussian, laplacian."
+            )
         if self.num_large_crops != 2:
             raise ValueError(
                 f"SplitTeacherSIGJEPA requires exactly 2 large crops, got {self.num_large_crops}."
@@ -175,6 +181,14 @@ class SplitTeacherSIGJEPA(BaseMethod):
         cfg.method_kwargs.lambda_pred = omegaconf_select(cfg, "method_kwargs.lambda_pred", 1.0)
         cfg.method_kwargs.lambda_teacher = omegaconf_select(cfg, "method_kwargs.lambda_teacher", 1.0)
         cfg.method_kwargs.lambda_sigreg = omegaconf_select(cfg, "method_kwargs.lambda_sigreg", 0.05)
+        cfg.method_kwargs.lambda_mmd = omegaconf_select(cfg, "method_kwargs.lambda_mmd", 0.0)
+        cfg.method_kwargs.mmd_kernel = str(
+            omegaconf_select(cfg, "method_kwargs.mmd_kernel", "energy")
+        ).lower()
+        if cfg.method_kwargs.mmd_kernel not in {"energy", "gaussian", "laplacian"}:
+            raise ValueError(
+                "method_kwargs.mmd_kernel must be one of: energy, gaussian, laplacian."
+            )
 
         cfg.method_kwargs.sigreg_num_slices = omegaconf_select(
             cfg, "method_kwargs.sigreg_num_slices", 256
@@ -287,6 +301,10 @@ class SplitTeacherSIGJEPA(BaseMethod):
     def use_free_branch(self) -> bool:
         return self.lambda_sigreg > 0 and self.free_dim > 0
 
+    @property
+    def use_mmd_branch(self) -> bool:
+        return self.lambda_mmd > 0
+
     def attach_teacher_prefetch_epoch_ref(self, epoch_ref) -> None:
         self._teacher_prefetch_epoch_ref = epoch_ref
 
@@ -396,16 +414,27 @@ class SplitTeacherSIGJEPA(BaseMethod):
         else:
             aligned_globals = teacher_globals = None
 
-        ssl_loss, pred_loss, teacher_loss, free_loss, free_loss_per_view = split_teacher_sigjepa_loss(
+        (
+            ssl_loss,
+            pred_loss,
+            teacher_loss,
+            free_loss,
+            mmd_loss,
+            free_loss_per_view,
+            mmd_loss_per_view,
+        ) = split_teacher_sigjepa_loss(
             global_latents=global_z,
             all_latents=all_z,
             aligned_globals=aligned_globals,
             teacher_globals=teacher_globals,
             free_views=all_z_f if self.use_free_branch else None,
+            mmd_views=all_z if self.use_mmd_branch else None,
             global_step=self.global_step,
             lambda_pred=self.lambda_pred,
             lambda_teacher=self.lambda_teacher,
             lambda_sigreg=self.lambda_sigreg,
+            lambda_mmd=self.lambda_mmd,
+            mmd_kernel=self.mmd_kernel,
             num_slices=self.sigreg_num_slices,
             num_points=self.sigreg_num_points,
             t_min=self.sigreg_t_min,
@@ -453,6 +482,7 @@ class SplitTeacherSIGJEPA(BaseMethod):
         self.log("train_pred_loss", pred_loss, on_epoch=True, sync_dist=True)
         self.log("train_teacher_loss", teacher_loss, on_epoch=True, sync_dist=True)
         self.log("train_sigreg_loss", free_loss, on_epoch=True, sync_dist=True)
+        self.log("train_mmd_loss", mmd_loss, on_epoch=True, sync_dist=True)
         self.log("train_teacher_cosine", teacher_cosine, on_epoch=True, sync_dist=True)
         self.log("train_zc_norm", zc_norm, on_epoch=True, sync_dist=True)
         self.log("train_zf_norm", zf_norm, on_epoch=True, sync_dist=True)
@@ -478,6 +508,14 @@ class SplitTeacherSIGJEPA(BaseMethod):
             if len(free_loss_per_view) > self.num_large_crops:
                 local_mean = torch.stack(free_loss_per_view[self.num_large_crops :]).mean()
                 self.log("train_sigreg_zf_local_mean", local_mean, on_epoch=True, sync_dist=True)
+
+            if len(mmd_loss_per_view) >= 1:
+                self.log("train_mmd_z1", mmd_loss_per_view[0], on_epoch=True, sync_dist=True)
+            if len(mmd_loss_per_view) >= 2:
+                self.log("train_mmd_z2", mmd_loss_per_view[1], on_epoch=True, sync_dist=True)
+            if len(mmd_loss_per_view) > self.num_large_crops:
+                mmd_local_mean = torch.stack(mmd_loss_per_view[self.num_large_crops :]).mean()
+                self.log("train_mmd_z_local_mean", mmd_local_mean, on_epoch=True, sync_dist=True)
 
         total = ssl_loss + class_loss + projector_class_loss
         return total

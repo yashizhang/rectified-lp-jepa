@@ -23,7 +23,6 @@ import omegaconf
 import torch
 import torch.nn as nn
 from solo.losses.rectified_lpjepa import (
-    build_geomloss_mmd,
     rectified_lp_jepa_loss,
     determine_sigma_for_lp_dist,
     choose_sigma_for_unit_var,
@@ -148,8 +147,6 @@ class RectifiedLpJEPA(BaseMethod):
         # Loss weights
         self.invariance_loss_weight: float = cfg.method_kwargs.invariance_loss_weight
         self.rdm_reg_loss_weight: float = cfg.method_kwargs.rdm_reg_loss_weight
-        self.lambda_mmd: float = cfg.method_kwargs.lambda_mmd
-        self.mmd_kernel: str = cfg.method_kwargs.mmd_kernel
 
         # Distribution and Projection parameters
         self.target_distribution: str = cfg.method_kwargs.target_distribution
@@ -170,14 +167,6 @@ class RectifiedLpJEPA(BaseMethod):
             raise ValueError(f"Invalid mode of sigma: {self.mode_of_sigma}")
         
         print(f"Chosen sigma for {self.target_distribution} with mean shift {self.mean_shift_value} and p_norm {self.lp_norm_parameter} is {self.chosen_sigma}")
-
-        self.mmd_criterion = None
-        if self.lambda_mmd > 0:
-            mmd_blur = max(float(self.chosen_sigma), 1e-6)
-            self.mmd_criterion = build_geomloss_mmd(
-                self.mmd_kernel,
-                blur=mmd_blur if self.mmd_kernel != "energy" else None,
-            )
 
         # Projector configuration
         proj_hidden_dim: int = cfg.method_kwargs.proj_hidden_dim
@@ -222,8 +211,6 @@ class RectifiedLpJEPA(BaseMethod):
         # Default loss weights
         cfg.method_kwargs.invariance_loss_weight = omegaconf_select(cfg, "method_kwargs.invariance_loss_weight", 25.0)
         cfg.method_kwargs.rdm_reg_loss_weight = omegaconf_select(cfg, "method_kwargs.rdm_reg_loss_weight", 125.0)
-        cfg.method_kwargs.lambda_mmd = omegaconf_select(cfg, "method_kwargs.lambda_mmd", 0.0)
-        cfg.method_kwargs.mmd_kernel = omegaconf_select(cfg, "method_kwargs.mmd_kernel", "energy")
         
         # Default distribution/projection settings
         cfg.method_kwargs.num_projections = omegaconf_select(cfg, "method_kwargs.num_projections", 8192)
@@ -232,9 +219,6 @@ class RectifiedLpJEPA(BaseMethod):
         cfg.method_kwargs.lp_norm_parameter = omegaconf_select(cfg, "method_kwargs.lp_norm_parameter", 1.0)
         cfg.method_kwargs.mode_of_sigma = omegaconf_select(cfg, "method_kwargs.mode_of_sigma", "sigma_GN")
         cfg.method_kwargs.projector_type = omegaconf_select(cfg, "method_kwargs.projector_type", "rectified_mlp")
-
-        assert cfg.method_kwargs.lambda_mmd >= 0.0
-        assert cfg.method_kwargs.mmd_kernel in {"gaussian", "laplacian", "energy"}
 
         return cfg
 
@@ -276,13 +260,11 @@ class RectifiedLpJEPA(BaseMethod):
         )
 
         # Compute Rectified LpJEPA Loss
-        loss_val, sim_l, reg_l, mmd_l = rectified_lp_jepa_loss(
+        loss_val, sim_l, reg_l = rectified_lp_jepa_loss(
             z1, z2, projection_vectors,
             target_distribution=self.target_distribution,
             invariance_loss_weight=self.invariance_loss_weight,
             rdm_reg_loss_weight=self.rdm_reg_loss_weight,
-            lambda_mmd=self.lambda_mmd,
-            mmd_criterion=self.mmd_criterion,
             mean_shift_value=self.mean_shift_value,
             lp_norm_parameter=self.lp_norm_parameter,
             chosen_sigma=self.chosen_sigma,
@@ -292,7 +274,6 @@ class RectifiedLpJEPA(BaseMethod):
         self.log("train_rectified_lp_jepa_loss", loss_val, on_epoch=True, sync_dist=True)
         self.log("train_invariance_loss", sim_l, on_epoch=True, sync_dist=True)
         self.log("train_rdm_reg_loss", reg_l, on_epoch=True, sync_dist=True)
-        self.log("train_mmd_loss", mmd_l, on_epoch=True, sync_dist=True)
 
         if do_log:
             # Gather across GPUs for global statistics logging

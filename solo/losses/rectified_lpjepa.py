@@ -18,18 +18,11 @@
 # DEALINGS IN THE SOFTWARE.
 
 import math
-from typing import Optional
-
 import torch
 import torch.nn.functional as F
 from solo.utils.misc import gather
 import mpmath as mp
 from torch.distributions.laplace import Laplace
-
-try:
-    from geomloss import SamplesLoss
-except ImportError:
-    SamplesLoss = None
 
 from solo.utils.metrics import (
     l1_sparsity_metric,
@@ -37,8 +30,6 @@ from solo.utils.metrics import (
     variance_loss,
     covariance_loss,
 )
-
-SUPPORTED_MMD_KERNELS = ("gaussian", "laplacian", "energy")
 
 # =========================
 # Invariance Loss
@@ -235,38 +226,6 @@ def rdmreg_loss(z1, z2, projection_vectors, target_dist, mean_shift_value=0.0, l
         raise ValueError("Invalid projection_vectors type")
     return (swd_loss_z1 + swd_loss_z2) / 2
 
-
-def build_geomloss_mmd(kernel: str, blur: Optional[float] = None):
-    """Builds a GeomLoss MMD criterion using the tensorized backend."""
-
-    if kernel not in SUPPORTED_MMD_KERNELS:
-        raise ValueError(
-            f"Unsupported mmd_kernel '{kernel}'. Expected one of {SUPPORTED_MMD_KERNELS}."
-        )
-    if SamplesLoss is None:
-        raise ImportError(
-            "geomloss is required when lambda_mmd > 0. Install geomloss==0.2.6."
-        )
-
-    kwargs = {"loss": kernel, "backend": "tensorized"}
-    if kernel in {"gaussian", "laplacian"}:
-        if blur is None or blur <= 0:
-            raise ValueError(
-                "A positive blur must be provided for gaussian and laplacian MMD kernels."
-            )
-        kwargs["blur"] = float(blur)
-
-    return SamplesLoss(**kwargs)
-
-
-def geomloss_mmd_loss(z1: torch.Tensor, z2: torch.Tensor, mmd_criterion) -> torch.Tensor:
-    """Computes GeomLoss MMD in float32 for numerical stability under mixed precision."""
-
-    if z1.is_cuda:
-        with torch.amp.autocast(device_type="cuda", enabled=False):
-            return mmd_criterion(z1.float(), z2.float())
-    return mmd_criterion(z1.float(), z2.float())
-
 # =========================
 # Main Rectified LpJEPA Loss
 # =========================
@@ -277,8 +236,6 @@ def rectified_lp_jepa_loss(
     target_distribution: str,
     invariance_loss_weight: float,
     rdm_reg_loss_weight: float,
-    lambda_mmd: float = 0.0,
-    mmd_criterion=None,
     mean_shift_value: float = 0.0,
     lp_norm_parameter: float = 1.0,
     chosen_sigma: float = None,
@@ -295,19 +252,7 @@ def rectified_lp_jepa_loss(
     
     # 3. RDMReg Loss (Distribution Matching)
     reg_loss = rdmreg_loss(z1_gathered, z2_gathered, projection_vectors, target_distribution, mean_shift_value, lp_norm_parameter, chosen_sigma)
-
-    # 4. Optional GeomLoss MMD across the global batch
-    if lambda_mmd > 0:
-        if mmd_criterion is None:
-            raise ValueError("mmd_criterion must be provided when lambda_mmd > 0.")
-        mmd_loss = geomloss_mmd_loss(z1_gathered, z2_gathered, mmd_criterion)
-    else:
-        mmd_loss = sim_loss.new_zeros(())
     
     # Total weighted loss - Variance and Covariance are logged separately in training_step
-    loss = (
-        (invariance_loss_weight * sim_loss)
-        + (rdm_reg_loss_weight * reg_loss)
-        + (lambda_mmd * mmd_loss)
-    )
-    return loss, sim_loss, reg_loss, mmd_loss
+    loss = (invariance_loss_weight * sim_loss) + (rdm_reg_loss_weight * reg_loss)
+    return loss, sim_loss, reg_loss

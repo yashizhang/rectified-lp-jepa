@@ -26,6 +26,8 @@ method_kwargs:
   lambda_pred: 1.0
   lambda_teacher: 1.0
   lambda_sigreg: 0.05
+  lambda_mmd: 0.0
+  mmd_kernel: "energy"
 
   sigreg_num_slices: 256
   sigreg_num_points: 17
