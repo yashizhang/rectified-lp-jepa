@@ -10,7 +10,7 @@ hydra:
   run:
     dir: .
 
-name: "split-teacher-sigjepa-mmd-energy-0p05-dinov2-imagenet100"
+name: "split-teacher-sigjepa-mmd-laplacian-0p05-blur1-dinov2-imagenet100"
 method: "split_teacher_sigjepa"
 backbone:
   name: "vit_small"
@@ -27,8 +27,8 @@ method_kwargs:
   lambda_teacher: 0.0
   lambda_sigreg: 0.0
   lambda_mmd: 0.05
-  mmd_kernel: "energy"
-  mmd_blur: null
+  mmd_kernel: "laplacian"
+  mmd_blur: 1.0
 
   sigreg_num_slices: 1024
   sigreg_num_points: 17

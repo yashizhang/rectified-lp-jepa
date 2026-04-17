@@ -120,6 +120,7 @@ def split_teacher_sigjepa_loss(
     lambda_sigreg: float = 0.05,
     lambda_mmd: float = 0.0,
     mmd_kernel: str = "energy",
+    mmd_blur: Optional[float] = None,
     mmd_views: Optional[Sequence[torch.Tensor]] = None,
     num_slices: int = 256,
     num_points: int = 17,
@@ -178,6 +179,7 @@ def split_teacher_sigjepa_loss(
             mmd_views,
             global_step=global_step,
             kernel=mmd_kernel,
+            blur=mmd_blur,
             ddp_sync=ddp_sync,
         )
     else:

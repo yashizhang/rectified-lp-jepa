@@ -21,13 +21,14 @@
 
 The loss samples a standard Gaussian target with the same shape as the model
 embeddings and compares the two empirical distributions with GeomLoss' MMD-like
-sample losses: energy, gaussian, or laplacian.
+sample losses: energy, gaussian, or laplacian. Gaussian and Laplacian MMDs
+can optionally receive GeomLoss' ``blur`` bandwidth parameter.
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -59,7 +60,7 @@ def _sync_samples(samples: torch.Tensor, ddp_sync: bool) -> torch.Tensor:
 
 
 @lru_cache(maxsize=None)
-def _geomloss_samples_loss(kernel: str):
+def _geomloss_samples_loss(kernel: str, blur: Optional[float]):
     if kernel not in VALID_MMD_KERNELS:
         raise ValueError(
             f"Unsupported MMD kernel '{kernel}'. Expected one of {VALID_MMD_KERNELS}."
@@ -73,7 +74,9 @@ def _geomloss_samples_loss(kernel: str):
             "`pip install geomloss` or install this project with its updated requirements."
         ) from exc
 
-    return SamplesLoss(loss=kernel)
+    if blur is None:
+        return SamplesLoss(loss=kernel)
+    return SamplesLoss(loss=kernel, blur=float(blur))
 
 
 def _standard_normal_like(
@@ -105,6 +108,7 @@ def mmd_loss(
     x: torch.Tensor,
     global_step: int,
     kernel: str = "energy",
+    blur: Optional[float] = None,
     view_idx: int = 0,
     ddp_sync: bool = True,
 ) -> torch.Tensor:
@@ -115,6 +119,9 @@ def mmd_loss(
         global_step: Current trainer global step. Used only to seed the Gaussian
             target deterministically.
         kernel: One of ``energy``, ``gaussian``, or ``laplacian``.
+        blur: Optional GeomLoss bandwidth. This is mainly intended for the
+            ``gaussian`` and ``laplacian`` kernels; ``None`` preserves
+            GeomLoss' default.
         view_idx: View index used to decorrelate the sampled target across crops.
         ddp_sync: If true, gather embeddings across DDP ranks before computing MMD.
     """
@@ -125,12 +132,15 @@ def mmd_loss(
         return x.new_zeros(())
 
     kernel = str(kernel).lower()
+    if blur is not None and float(blur) <= 0:
+        raise ValueError(f"mmd_blur must be positive when set, got {blur}.")
+
     work_dtype = _work_dtype(x)
     x = x.to(dtype=work_dtype)
     x = _sync_samples(x, ddp_sync=ddp_sync)
     target = _standard_normal_like(x, global_step=global_step, view_idx=view_idx).detach()
 
-    loss_fn = _geomloss_samples_loss(kernel)
+    loss_fn = _geomloss_samples_loss(kernel, None if blur is None else float(blur))
     return loss_fn(x, target)
 
 
@@ -138,6 +148,7 @@ def mmd_regularization_loss(
     views: Sequence[torch.Tensor],
     global_step: int,
     kernel: str = "energy",
+    blur: Optional[float] = None,
     ddp_sync: bool = True,
 ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
     """Applies MMD regularization independently to each embedding view."""
@@ -155,6 +166,7 @@ def mmd_regularization_loss(
                 view,
                 global_step=global_step,
                 kernel=kernel,
+                blur=blur,
                 view_idx=view_idx,
                 ddp_sync=ddp_sync,
             )

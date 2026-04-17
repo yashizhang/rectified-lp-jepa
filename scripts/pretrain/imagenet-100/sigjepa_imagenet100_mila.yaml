@@ -24,6 +24,7 @@ method_kwargs:
   lambda_sigreg: 0.05
   lambda_mmd: 0.0
   mmd_kernel: "energy"
+  mmd_blur: null
   sigreg_num_slices: 256
   sigreg_num_points: 17
   sigreg_t_min: -5.0

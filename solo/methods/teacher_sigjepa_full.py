@@ -17,7 +17,7 @@
 # OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import omegaconf
 import torch
@@ -50,6 +50,8 @@ class TeacherSIGJEPAFull(BaseMethod):
         self.lambda_sigreg: float = float(cfg.method_kwargs.lambda_sigreg)
         self.lambda_mmd: float = float(cfg.method_kwargs.lambda_mmd)
         self.mmd_kernel: str = str(cfg.method_kwargs.mmd_kernel).lower()
+        cfg_mmd_blur = omegaconf_select(cfg, "method_kwargs.mmd_blur", None)
+        self.mmd_blur: Optional[float] = None if cfg_mmd_blur is None else float(cfg_mmd_blur)
 
         self.projector_type: str = cfg.method_kwargs.projector_type
         self.proj_output_dim: int = int(cfg.method_kwargs.proj_output_dim)
@@ -64,6 +66,8 @@ class TeacherSIGJEPAFull(BaseMethod):
             assert self.mmd_kernel in {"energy", "gaussian", "laplacian"}, (
                 "mmd_kernel must be one of: energy, gaussian, laplacian."
             )
+            if self.mmd_blur is not None and self.mmd_blur <= 0:
+                raise ValueError("method_kwargs.mmd_blur must be positive when set.")
 
         if self.num_large_crops != 2:
             raise ValueError(
@@ -130,6 +134,9 @@ class TeacherSIGJEPAFull(BaseMethod):
         cfg.method_kwargs.mmd_kernel = str(
             omegaconf_select(cfg, "method_kwargs.mmd_kernel", "energy")
         ).lower()
+        cfg.method_kwargs.mmd_blur = omegaconf_select(cfg, "method_kwargs.mmd_blur", None)
+        if cfg.method_kwargs.mmd_blur is not None and float(cfg.method_kwargs.mmd_blur) <= 0:
+            raise ValueError("method_kwargs.mmd_blur must be positive when set.")
         if cfg.method_kwargs.mmd_kernel not in {"energy", "gaussian", "laplacian"}:
             raise ValueError(
                 "method_kwargs.mmd_kernel must be one of: energy, gaussian, laplacian."
@@ -254,6 +261,7 @@ class TeacherSIGJEPAFull(BaseMethod):
             lambda_sigreg=self.lambda_sigreg,
             lambda_mmd=self.lambda_mmd,
             mmd_kernel=self.mmd_kernel,
+            mmd_blur=self.mmd_blur,
             num_slices=self.sigreg_num_slices,
             num_points=self.sigreg_num_points,
             t_min=self.sigreg_t_min,
